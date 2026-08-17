@@ -951,6 +951,18 @@ def build_dashboard():
     dash_html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "omni_dashboard.html")
 
+    @app_dashboard.before_request
+    def _readiness_guard():
+        # The page itself is always served. Data routes return the same JSON
+        # contract while the lightweight sidecar is active, so the frontend can
+        # retry instead of converting a missing database into ConnectError.
+        if omni_state().get("phase") == "dashboard" and request.path != "/":
+            if request.path != "/api/health":
+                return jsonify({"ok": True, "ready": False,
+                                "omni": omni_state(),
+                                "error": "full Omni model workers are disabled"}), 200
+        return None
+
     @app_dashboard.route("/")
     def index():
         with open(dash_html_path, "r", encoding="utf-8") as f:
@@ -1802,6 +1814,16 @@ def main():
     import asyncio
     import nest_asyncio
     nest_asyncio.apply()
+
+    # The workstation must have a live /omni surface even when the v2 process
+    # plane owns the GPUs. This mode intentionally does not import model weights,
+    # start databases, or claim queues; it binds the dashboard and reports its
+    # readiness state until the full Omni worker mode is explicitly enabled.
+    if "--dashboard-only" in sys.argv:
+        _set_omni_state("dashboard", "dashboard-only; model workers are disabled")
+        log("🔮 Omni dashboard sidecar online — model workers held back")
+        run_dashboard()
+        return
 
     log("🚀 Omniscient Engine igniting — tri-partite DB + Layer 5 orchestration")
     _set_omni_state("starting", "dashboard binding before model warm-up")

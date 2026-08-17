@@ -461,6 +461,14 @@
         function loadGraphHealth() {
             const el = document.getElementById('graph-banner');
             fetch('api/graph/health').then(r => r.json()).then(h => {
+                if (h.ready === false) {
+                    el.className = 'banner warn';
+                    el.innerHTML = '<b>Omni dashboard is online but still starting.</b> '
+                        + esc((h.omni && h.omni.message) || 'Waiting for the service sidecar.')
+                        + ' Retrying automatically…';
+                    setTimeout(loadGraphHealth, 3000);
+                    return;
+                }
                 if (!h.neo4j) {
                     el.className = 'banner err';
                     el.innerHTML = '<b>Neo4j offline.</b> The knowledge graph is unavailable; '
@@ -475,7 +483,11 @@
                     return;
                 }
                 el.className = 'banner off';
-            }).catch(() => { el.className = 'banner off'; });
+            }).catch(() => {
+                el.className = 'banner warn';
+                el.innerHTML = '<b>Omni health is temporarily unavailable.</b> Retrying automatically…';
+                setTimeout(loadGraphHealth, 3000);
+            });
         }
 
         function loadGlobalGraph() {
@@ -483,6 +495,11 @@
             scope.innerText = 'loading corpus graph…';
             loadGraphHealth();
             fetch('api/neo4j/graph?limit=400').then(r => r.json()).then(data => {
+                if (data.ready === false) {
+                    scope.innerText = 'Omni is starting — retrying graph load…';
+                    setTimeout(loadGlobalGraph, 3000);
+                    return;
+                }
                 if (data.error) {
                     scope.innerText = data.error;
                     renderLegend('global-legend', null);
@@ -499,7 +516,10 @@
                     const uuid = props && props.properties && props.properties.uuid;
                     if (uuid) loadDeepDive(uuid);
                 });
-            }).catch(e => { scope.innerText = 'Graph fetch failed — engine may still be booting.'; });
+            }).catch(e => {
+                scope.innerText = 'Graph service is starting — retrying…';
+                setTimeout(loadGlobalGraph, 3000);
+            });
         }
 
         /* ═══════ VIDEO INDEX ═══════
@@ -570,6 +590,12 @@
 
         function loadVideoIndex() {
             fetch('api/videos').then(r => r.json()).then(data => {
+                if (data.ready === false) {
+                    document.getElementById('vlist-content').innerHTML =
+                        '<p style="color:#d29922;">Omni is starting — retrying…</p>';
+                    setTimeout(loadVideoIndex, 3000);
+                    return;
+                }
                 if (data.error) {
                     document.getElementById('vlist-content').innerHTML =
                         `<p style="color:#f85149;">${esc(data.error)}</p>`;
@@ -579,7 +605,8 @@
                 renderVideoList();
             }).catch(e => {
                 document.getElementById('vlist-content').innerHTML =
-                    '<p style="color:#f85149;">Engine still booting — refresh shortly.</p>';
+                    '<p style="color:#d29922;">Omni is starting — retrying automatically…</p>';
+                setTimeout(loadVideoIndex, 3000);
             });
         }
         loadVideoIndex();

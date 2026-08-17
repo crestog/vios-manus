@@ -299,6 +299,10 @@ REDIS_PORT = int(os.environ.get('VIOS_REDIS_PORT', 6379))
 #   Set VIOS_OMNI=0 to disable the whole subsystem.
 # ═══════════════════════════════════════════════════════════
 OMNI_ENABLED = os.environ.get('VIOS_OMNI', '1') != '0'
+# Keep the Omni web surface alive while the v2 processing plane owns GPU work.
+# Set VIOS_OMNI_DASHBOARD_ONLY=0 only when intentionally running the full Omni
+# model stack under an explicit GPU allocation plan.
+OMNI_DASHBOARD_ONLY = os.environ.get('VIOS_OMNI_DASHBOARD_ONLY', '1') != '0'
 
 # Filesystem — both on scratch: bot downloads are re-fetchable from Telegram and
 # the vector store is rebuildable from the frames, so neither belongs in the

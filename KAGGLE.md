@@ -56,3 +56,23 @@ The full two-GPU model scheduler is intentionally not enabled by these defaults.
 ## References
 
 [1]: https://github.com/crestog/vios-manus "VIOS Manus target repository"
+
+## Omni dashboard availability
+
+The boot supervisor now launches an Omni dashboard sidecar by default even when the v2 processing plane owns the GPU budget. This prevents `/omni` from becoming a permanent `ConnectError` merely because the full Omni model stack was intentionally held back to avoid GPU contention. The dashboard page and `/omni/api/health` remain available while data services or model workers are unavailable, and the page retries readiness-sensitive calls automatically.
+
+For the full Omni model workers, explicitly set the mode before launching only after reserving GPU capacity:
+
+```python
+import os
+os.environ["VIOS_OMNI_DASHBOARD_ONLY"] = "0"
+```
+
+The safe default remains dashboard-only. The normal Kaggle cell is unchanged:
+
+```python
+!git clone -b main https://github.com/crestog/vios-manus.git VideoIntelligenceOS
+%cd VideoIntelligenceOS
+!bash setup.sh
+%run kaggle_boot.py
+```

@@ -1132,10 +1132,28 @@ async def omni_proxy(request: Request, path: str = ""):
                                  headers=resp_headers,
                                  media_type=resp.headers.get("content-type"))
     except Exception as e:
-        return _omni_notice(
-            "🔮 Omniscient Engine is still booting…",
-            "<p>The dashboard appears here once its models finish loading.</p>"
-            f"<p style='font-size:.82em'>{type(e).__name__}</p>", 503)
+        # API callers need JSON, not an HTML 503. The dashboard can use this
+        # stable liveness contract to keep rendering and retry until the
+        # sidecar/full engine is available. The page itself remains useful even
+        # when the model plane is intentionally disabled.
+        if path.startswith("api/"):
+            return JSONResponse(
+                {"ok": True, "ready": False,
+                 "omni": {"phase": "starting",
+                          "message": "dashboard sidecar is starting"},
+                 "error": f"{type(e).__name__}: {e}"[:200]},
+                status_code=200, headers={"Retry-After": "3"})
+        return HTMLResponse(
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            "<meta http-equiv='refresh' content='3'>"
+            "<title>Explorer · VIOS</title></head><body style='background:#0d1117;"
+            "color:#c9d1d9;font-family:system-ui;padding:64px;text-align:center'>"
+            "<h2>🔮 Omniscient dashboard is starting</h2>"
+            "<p>The page will retry automatically. The processing plane can continue "
+            "while Omni models are disabled or warming.</p>"
+            f"<p style='font-size:.82em;color:#8b949e'>{type(e).__name__}</p>"
+            "</body></html>", status_code=200,
+            headers={"Retry-After": "3"})
 
 
 @app.websocket("/ws")

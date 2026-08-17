@@ -284,9 +284,10 @@ else:
 # PHASE 4: IGNITION
 # ══════════════════════════════════════════════════════════
 try:
-    from config import OMNI_ENABLED
+    from config import OMNI_ENABLED, OMNI_DASHBOARD_ONLY
 except Exception:
     OMNI_ENABLED = False
+    OMNI_DASHBOARD_ONLY = True
 
 # ── Who owns the GPU ──────────────────────────────────────────────────────
 # Two planes in this repository load models, and until now both did, onto the
@@ -303,14 +304,12 @@ except Exception:
 # v2 registry already runs at higher coverage. So one plane owns the card, and
 # it is the one whose output the product is built on.
 #
-#   VIOS_GPU_OWNER=v2  (default) — the processing engine gets the whole card.
-#                                  model_manager and omni_engine do not start.
-#                                  The Postgres/Neo4j/Redis services and every
-#                                  CPU worker are untouched.
-#   VIOS_GPU_OWNER=v1            — the old behaviour, both planes, for when the
-#                                  omniscient dashboard is what you are working
-#                                  on and the v2 sweep is stopped.
-#   VIOS_GPU_OWNER=both          — explicitly opt back into the contention.
+#   VIOS_GPU_OWNER=v2  (default) — the processing plane owns GPU work.
+#                                  The Omni dashboard still starts as a lightweight
+#                                  sidecar; its model workers stay off.
+#   VIOS_GPU_OWNER=v1            — legacy model_manager + full Omni mode.
+#   VIOS_GPU_OWNER=both          — explicitly opt into both legacy GPU stacks.
+#   VIOS_OMNI_DASHBOARD_ONLY=0  — opt into full Omni model workers intentionally.
 GPU_OWNER = (os.environ.get("VIOS_GPU_OWNER", "") or "v2").strip().lower()
 if GPU_OWNER not in ("v1", "v2", "both"):
     GPU_OWNER = "v2"
@@ -391,8 +390,10 @@ if V1_GPU:
     print("   🤖 [ENGINE]    → model_manager.py  (7 SOTA GPU models)", flush=True)
 print("   🖥️ [UI]        → ui_server.py      (FastAPI + Ghost Worker)", flush=True)
 print("   🎞️ [CV-ENGINE] → frame_worker.py   (OpenCV frame extraction)", flush=True)
-if OMNI_ENABLED and V1_GPU:
-    print("   🔮 [OMNI]      → omni_engine.py    (Tri-partite DB + GraphRAG + Bot)", flush=True)
+if OMNI_ENABLED and not OMNI_DASHBOARD_ONLY:
+    print("   🔮 [OMNI]      → omni_engine.py    (full DB + GraphRAG + Bot)", flush=True)
+elif OMNI_ENABLED and OMNI_DASHBOARD_ONLY:
+    print("   🔮 [OMNI]      → dashboard sidecar (model workers held back)", flush=True)
 elif not OMNI_ENABLED:
     # Said out loud, because the silent version cost a session. VIOS_OMNI=0
     # switches off Neo4j, Postgres, GraphRAG, the narrative passes and /omni,
@@ -407,14 +408,14 @@ elif not OMNI_ENABLED:
 print("-" * 60, flush=True)
 print(f"   🎛️ GPU owner   → {GPU_OWNER}", flush=True)
 if not V1_GPU:
-    # Named, with the reason and the way back. A worker that silently does not
-    # start is indistinguishable from one that started and did nothing.
-    print("      model_manager.py and omni_engine.py are held back so the",
+    print("      model_manager.py is held back so the processing engine has",
           flush=True)
-    print("      processing engine has the whole card — the two planes were",
+    print("      the GPU admission budget. The Omni dashboard remains available",
           flush=True)
-    print("      OOM-ing each other over the same seven models.", flush=True)
-    print("      VIOS_GPU_OWNER=both restores the old behaviour.", flush=True)
+    print("      as a lightweight sidecar; set VIOS_OMNI_DASHBOARD_ONLY=0 only",
+          flush=True)
+    print("      after explicitly reserving GPU capacity for full Omni models.",
+          flush=True)
 print("=" * 60, flush=True)
 print("", flush=True)
 
@@ -423,8 +424,13 @@ if V1_GPU:
     threading.Thread(target=run_with_watchdog, args=(["python", "-u", "model_manager.py"], "🤖 [ENGINE]", True), daemon=True).start()
 threading.Thread(target=run_with_watchdog, args=(["python", "-u", "ui_server.py"], "🖥️ [UI]", False), daemon=True).start()
 threading.Thread(target=run_with_watchdog, args=(["python", "-u", "frame_worker.py"], "🎞️ [CV-ENGINE]", False), daemon=True).start()
-if OMNI_ENABLED and V1_GPU:
-    threading.Thread(target=run_with_watchdog, args=(["python", "-u", "omni_engine.py"], "🔮 [OMNI]", True), daemon=True).start()
+if OMNI_ENABLED:
+    _omni_cmd = (["python", "-u", "omni_dashboard_sidecar.py"]
+                 if OMNI_DASHBOARD_ONLY else
+                 ["python", "-u", "omni_engine.py"])
+    threading.Thread(target=run_with_watchdog,
+                     args=(_omni_cmd, "🔮 [OMNI]", not OMNI_DASHBOARD_ONLY),
+                     daemon=True).start()
 
 try:
     # Keep main orchestrator alive indefinitely
