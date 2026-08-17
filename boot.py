@@ -119,7 +119,10 @@ def run_with_watchdog(command, prefix, is_engine):
             bufsize=1
         )
         WATCHDOG_STATE[prefix] = {"pid": process.pid, "crashes": crashes,
-                                  "since": started, "delay": delay}
+                                  "since": started, "started_at": started,
+                                  "last_heartbeat": time.time(),
+                                  "state": "running", "delay": delay,
+                                  "command": os.path.basename(command[-1])}
         _publish_watchdog()
         stream_logs(process.stdout, prefix, is_engine)
         process.wait()
@@ -133,9 +136,13 @@ def run_with_watchdog(command, prefix, is_engine):
             crashes += 1
             delay = min(delay * 2, 120)
         WATCHDOG_STATE[prefix] = {"pid": 0, "crashes": crashes,
-                                  "since": started, "delay": delay,
+                                  "since": started, "started_at": started,
+                                  "last_heartbeat": time.time(),
+                                  "last_exit_at": time.time(),
+                                  "state": "backoff", "delay": delay,
                                   "exit": process.returncode,
-                                  "lived": round(lived, 1)}
+                                  "lived": round(lived, 1),
+                                  "command": os.path.basename(command[-1])}
         _publish_watchdog()
         note = f" — {crashes} in a row" if crashes > 1 else ""
         print(f"\n⚠️ [WATCHDOG] {prefix} crashed (exit={process.returncode}, "

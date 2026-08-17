@@ -22,6 +22,7 @@ Key Schema (Redis):
 
 import redis
 import json
+import os
 import socket
 import time
 import uuid
@@ -110,6 +111,8 @@ PRIORITY_QUEUES = {"QUEUE_VISION", "QUEUE_OMNI_VISION", "QUEUE_OMNI_ORACLE"}
 ALL_QUEUES = ["QUEUE_VISION", "QUEUE_ANALYZE", "QUEUE_MODELS",
               "QUEUE_OMNI_VISION", "QUEUE_OMNI_ORACLE"]
 MAX_RETRIES = 3
+LEASE_SECONDS = max(60.0, float(os.environ.get("VIOS_QUEUE_LEASE_SECONDS", "2400")))
+LEASE_PREFIX = "VIOS_JOB_STATE:"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -120,6 +123,7 @@ def _default_key(q):     return f"{q}_DEFAULT"
 def _processing_key(q):  return f"{q}_PROCESSING"
 def _dlq_key(q):         return f"{q}_DLQ"
 def _metrics_key():      return "VIOS_METRICS"
+def _job_state_key(job_id): return f"{LEASE_PREFIX}{job_id}"
 
 def _lanes(q):
     """(priority_lane, default_lane) — non-priority queues use one lane."""
@@ -137,11 +141,14 @@ def push_job(queue_name, payload, is_priority=False):
     r = get_redis()
     job_id = f"job:{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
 
+    now = time.time()
     job = {
         "id": job_id,
         "payload": payload,
-        "created_at": time.time(),
+        "created_at": now,
         "retries": 0,
+        "status": "QUEUED",
+        "queue": queue_name,
     }
     job_data = json.dumps(job)
 
@@ -150,6 +157,15 @@ def push_job(queue_name, payload, is_priority=False):
 
     pipe = r.pipeline()
     pipe.lpush(lane, job_data)
+    pipe.hset(_job_state_key(job_id), mapping={
+        "job_id": job_id,
+        "queue": queue_name,
+        "state": "queued",
+        "created_at": str(now),
+        "updated_at": str(now),
+        "retries": "0",
+    })
+    pipe.expire(_job_state_key(job_id), max(int(LEASE_SECONDS * 4), 3600))
     pipe.hincrby(_metrics_key(), f"{queue_name}:pushed", 1)
     pipe.execute()
 
@@ -184,10 +200,54 @@ def claim_job(queue_name, timeout=2):
         return None, None
 
     job = json.loads(job_raw)
-    job["claimed_at"] = time.time()
+    now = time.time()
+    owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+    job["claimed_at"] = now
+    job["lease_owner"] = owner
+    job["lease_expires_at"] = now + LEASE_SECONDS
+    job["status"] = "LEASED"
+    r.hset(_job_state_key(job.get("id", "unknown")), mapping={
+        "job_id": job.get("id", ""),
+        "queue": queue_name,
+        "state": "leased",
+        "owner": owner,
+        "claimed_at": str(now),
+        "lease_expires_at": str(now + LEASE_SECONDS),
+        "updated_at": str(now),
+        "retries": str(job.get("retries", 0)),
+    })
+    r.expire(_job_state_key(job.get("id", "unknown")), max(int(LEASE_SECONDS * 4), 3600))
     r.hincrby(_metrics_key(), f"{queue_name}:claimed", 1)
 
     return job, job_raw
+
+
+def heartbeat_job(queue_name, job, lease_seconds=None, progress=""):
+    """Renew a claimed job lease without moving or rewriting its queue entry."""
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        return False
+    now = time.time()
+    seconds = max(60.0, float(lease_seconds or LEASE_SECONDS))
+    expires = now + seconds
+    job["lease_expires_at"] = expires
+    if progress:
+        job["progress"] = str(progress)[:300]
+    r = get_redis()
+    mapping = {"state": "running", "updated_at": str(now),
+               "lease_expires_at": str(expires)}
+    if progress:
+        mapping["progress"] = str(progress)[:300]
+    r.hset(_job_state_key(job_id), mapping=mapping)
+    r.expire(_job_state_key(job_id), max(int(seconds * 4), 3600))
+    return True
+
+
+def get_job_state(job_id):
+    """Return durable lease/status metadata for an envelope, if present."""
+    if not job_id:
+        return {}
+    return get_redis().hgetall(_job_state_key(str(job_id)))
 
 
 # ═══════════════════════════════════════════════════════════
@@ -198,6 +258,8 @@ def ack_job(queue_name, job, job_raw):
     r = get_redis()
     pipe = r.pipeline()
     pipe.lrem(_processing_key(queue_name), 1, job_raw)
+    if job.get("id"):
+        pipe.delete(_job_state_key(job["id"]))
     pipe.hincrby(_metrics_key(), f"{queue_name}:completed", 1)
 
     if "claimed_at" in job:
@@ -226,6 +288,12 @@ def fail_job(queue_name, job, job_raw, error_msg):
         job["last_failed_at"] = time.time()
 
         pipe = r.pipeline()
+        if job.get("id"):
+            pipe.hset(_job_state_key(job["id"]), mapping={
+                "state": "queued", "updated_at": str(time.time()),
+                "last_error": str(error_msg)[:200],
+                "retries": str(job["retries"]),
+            })
         pipe.lpush(default_lane, json.dumps(job))
         pipe.hincrby(_metrics_key(), f"{queue_name}:retries", 1)
         pipe.execute()
@@ -236,6 +304,13 @@ def fail_job(queue_name, job, job_raw, error_msg):
         job["died_at"] = time.time()
 
         pipe = r.pipeline()
+        if job.get("id"):
+            pipe.hset(_job_state_key(job["id"]), mapping={
+                "state": "dead_letter", "updated_at": str(time.time()),
+                "last_error": str(error_msg)[:200],
+                "retries": str(job.get("retries", 0)),
+            })
+            pipe.expire(_job_state_key(job["id"]), 7 * 24 * 3600)
         pipe.lpush(_dlq_key(queue_name), json.dumps(job))
         pipe.hincrby(_metrics_key(), f"{queue_name}:dead", 1)
         pipe.execute()
@@ -276,6 +351,15 @@ def recover_processing_jobs(queue_name, max_recoveries=None):
         count += 1
 
         if max_recoveries is None:
+            try:
+                recovered = json.loads(orphan)
+                if recovered.get("id"):
+                    r.hset(_job_state_key(recovered["id"]), mapping={
+                        "state": "queued", "updated_at": str(time.time()),
+                        "lease_owner": "", "lease_expires_at": "0",
+                    })
+            except (ValueError, TypeError):
+                pass
             continue
 
         try:
@@ -296,11 +380,35 @@ def recover_processing_jobs(queue_name, max_recoveries=None):
             count -= 1
             quarantined += 1
         else:
+            job["status"] = "QUEUED"
+            if job.get("id"):
+                pipe.hset(_job_state_key(job["id"]), mapping={
+                    "state": "queued", "updated_at": str(time.time()),
+                    "lease_owner": "", "lease_expires_at": "0",
+                    "recoveries": str(job["recoveries"]),
+                })
             pipe.lpush(default_lane, json.dumps(job))   # same position, updated count
         pipe.execute()
 
     if count > 0:
         r.hincrby(_metrics_key(), f"{queue_name}:recovered", count)
+
+    # The boot-time sweep intentionally recovers all in-flight entries because
+    # the previous process is known to be gone. Clear their old lease metadata;
+    # the next claim creates a fresh owner and expiry.
+    try:
+        for raw in r.lrange(default_lane, 0, -1):
+            try:
+                recovered = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if recovered.get("status") == "LEASED" and recovered.get("id"):
+                r.hset(_job_state_key(recovered["id"]), mapping={
+                    "state": "queued", "updated_at": str(time.time()),
+                    "lease_owner": "", "lease_expires_at": "0",
+                })
+    except Exception:
+        pass
     if quarantined > 0:
         _safe_print(f"   ☠️ {queue_name}: quarantined {quarantined} job(s) that "
                     f"repeatedly crashed the worker — see the DLQ.")
@@ -337,6 +445,7 @@ def get_queue_metrics(queue_name=None):
             "total_dead": int(r.hget(_metrics_key(), f"{q}:dead") or 0),
             "total_recovered": int(r.hget(_metrics_key(), f"{q}:recovered") or 0),
             "last_duration_sec": r.hget(_metrics_key(), f"{q}:last_duration_sec") or "N/A",
+            "lease_seconds": LEASE_SECONDS,
         }
 
     result["_global"] = {

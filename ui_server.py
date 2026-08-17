@@ -994,14 +994,36 @@ def _worker_health() -> dict:
     except (OSError, ValueError):
         return {"known": False}
     workers = data.get("workers") or {}
+    now = time.time()
+    supervisor_at = float(data.get("at") or 0.0)
+    stale_after = max(30.0, float(os.environ.get("VIOS_WATCHDOG_STALE_SECONDS", "90")))
+    stale = not supervisor_at or (now - supervisor_at) > stale_after
     flapping = {name: st for name, st in workers.items()
                 if isinstance(st, dict) and int(st.get("crashes") or 0) >= 2}
     down = [name for name, st in workers.items()
-            if isinstance(st, dict) and not st.get("pid")]
-    return {"known": True, "at": data.get("at", 0), "workers": workers,
-            "flapping": flapping, "down": down,
-            "note": (", ".join(f"{n} crashed {st['crashes']}× in a row"
-                               for n, st in flapping.items()) or "")}
+            if isinstance(st, dict) and not st.get("pid") and
+            st.get("state") not in ("disabled", "stopped")]
+    heartbeat_age = {}
+    for name, st in workers.items():
+        if isinstance(st, dict):
+            beat = float(st.get("last_heartbeat") or st.get("since") or 0.0)
+            heartbeat_age[name] = round(max(0.0, now - beat), 1) if beat else None
+    if stale:
+        state = "failed"
+    elif flapping or down:
+        state = "degraded"
+    else:
+        state = "ready"
+    notes = []
+    if stale:
+        notes.append(f"watchdog heartbeat is older than {stale_after:.0f}s")
+    notes.extend(f"{n} crashed {st.get('crashes', 0)}× in a row"
+                 for n, st in flapping.items())
+    return {"known": True, "at": supervisor_at, "workers": workers,
+            "flapping": flapping, "down": down, "state": state,
+            "stale": stale, "stale_after_seconds": stale_after,
+            "heartbeat_age_seconds": heartbeat_age,
+            "note": ", ".join(notes)}
 
 
 @app.get("/api/status")
@@ -1025,8 +1047,11 @@ def get_status():
             free_gb = f"{disk.free / (1024**3):.1f} GB"
         except Exception:
             free_gb = "N/A"
+        workers = _worker_health()
         cached = cache_put("status:payload", {"queue": metrics, "disk_free": free_gb,
-                                              "workers": _worker_health()}, 1.0)
+                                              "workers": workers,
+                                              "health": {"state": workers.get("state", "unknown"),
+                                                         "watchdog": workers}}, 1.0)
     return {"status": GLOBAL_STATUS, **cached}
 
 # ── OMNISCIENT DASHBOARD PROXY ──
