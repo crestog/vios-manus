@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 
 from .. import registry
 from .base import Emission, Job, SkipPass, device_and_dtype, torch_dtype
@@ -53,6 +54,16 @@ def _read(path: str):
 
 def _batch(job: Job, default: int = 32) -> int:
     return max(1, int(job.params.get("batch", default)))
+
+
+def _kaggle_ocr_only() -> bool:
+    """Kaggle policy: EasyOCR is the supported OCR backend in this image."""
+    raw = os.environ.get("VIOS_KAGGLE_OCR_EASYOCR_ONLY", "1").strip().lower()
+    forced = raw not in ("0", "false", "no", "off")
+    on_kaggle = bool(os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or
+                     os.path.isdir("/kaggle/input") or
+                     os.path.isdir("/kaggle/working"))
+    return forced and on_kaggle
 
 
 def _coverage(job: Job, read: int) -> dict:
@@ -132,19 +143,42 @@ def _embed_frames(job: Job, bundle: dict, space: str) -> tuple:
             keep_t.append(float(t))
         if not images:
             continue
-        with torch.no_grad():
-            inputs = proc(images=images, return_tensors="pt")
-            if device == "cuda":
-                inputs = {k: v.to("cuda") for k, v in inputs.items()}
-                if "pixel_values" in inputs:
-                    inputs["pixel_values"] = inputs["pixel_values"].to(
-                        model.dtype)
-            vecs = model.get_image_features(**inputs)
-            vecs = (vecs / vecs.norm(dim=-1, keepdim=True)
-                    ).float().cpu().numpy()
+        def encode(batch_images):
+            with torch.no_grad():
+                inputs = proc(images=batch_images, return_tensors="pt")
+                if device == "cuda":
+                    inputs = {k: v.to("cuda") for k, v in inputs.items()}
+                    if "pixel_values" in inputs:
+                        inputs["pixel_values"] = inputs["pixel_values"].to(
+                            model.dtype)
+                out = model.get_image_features(**inputs)
+                return (out / out.norm(dim=-1, keepdim=True)
+                        ).float().cpu().numpy()
+
+        try:
+            vecs = encode(images)
+            used_i, used_t = keep_i, keep_t
+        except Exception as exc:
+            # A malformed JPEG, transient CUDA allocation, or one problematic
+            # image must not discard an otherwise valid 32-frame batch. Retry
+            # each image independently; the failed frame is then visible in the
+            # coverage note instead of becoming a 100% video-level error.
+            job.note(f"{space} batch {keep_i[0]}–{keep_i[-1]} failed: "
+                     f"{type(exc).__name__}; retrying per frame")
+            rows, used_i, used_t = [], [], []
+            for image, fi, ft in zip(images, keep_i, keep_t):
+                try:
+                    rows.append(encode([image])[0])
+                    used_i.append(fi)
+                    used_t.append(ft)
+                except Exception:
+                    continue
+            if not rows:
+                continue
+            vecs = np.vstack(rows)
         blocks.append(vecs)
-        idxs.extend(keep_i)
-        times.extend(keep_t)
+        idxs.extend(used_i)
+        times.extend(used_t)
 
     if not blocks:
         raise SkipPass(f"no frame could be read for the {space} tower")
@@ -503,13 +537,19 @@ def ocr(job: Job) -> Emission:
     """
     langs = list(job.component.params.get("languages", ["en"]))
     floor = float(job.component.params.get("min_confidence", 0.6))
+    kaggle_only = _kaggle_ocr_only()
+    if kaggle_only:
+        job.note("Kaggle OCR policy: EasyOCR only; PaddleOCR disabled")
 
     def loader():
         gpu = bool(job.resources.get("gpu_count"))
-        try:
-            from paddleocr import PaddleOCR  # noqa: PLC0415
-        except ImportError:
+        if kaggle_only:
             PaddleOCR = None
+        else:
+            try:
+                from paddleocr import PaddleOCR  # noqa: PLC0415
+            except ImportError:
+                PaddleOCR = None
 
         # PaddleOCR has had three constructor generations and Kaggle's image
         # pins whichever one it pins this month. Try the compatible forms, but
@@ -549,7 +589,8 @@ def ocr(job: Job) -> Emission:
             reader = easyocr.Reader(langs or ["en"],
                                     gpu=("cuda:0" if gpu else False),
                                     verbose=False)
-            job.note("PaddleOCR unavailable; using EasyOCR fallback")
+            job.note("using EasyOCR" if kaggle_only else
+                     "PaddleOCR unavailable; using EasyOCR fallback")
             return {"easyocr": reader}
         except Exception as exc:                  # noqa: BLE001
             job.note(f"EasyOCR fallback unavailable: {type(exc).__name__}: {exc}")
@@ -668,6 +709,8 @@ def ocr_alt(job: Job) -> Emission:
     and is the slowest pass in the perception stage. That is accepted: the cost
     of the second reader is time, and time is explicitly not the constraint.
     """
+    if _kaggle_ocr_only():
+        raise SkipPass("Florence-2 disabled on Kaggle; EasyOCR is the supported OCR path")
     try:
         import torch  # noqa: PLC0415
         from PIL import Image  # noqa: PLC0415

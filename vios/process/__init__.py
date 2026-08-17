@@ -37,7 +37,7 @@ __all__ = ["SCHEMA_VERSION", "CHANNELS"]
 # `frame_vector` / `frame_metric` tables. Additive only — a v1 database is
 # migrated in place on open and a v1 shard still replays, because the channel
 # holds the only copy of everything processed before this change.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # The evidence channels. This is not a loose vocabulary — it is the same list
 # the interface colours by (doc 11's channel spectrum), so adding one here means

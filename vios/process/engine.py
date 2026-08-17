@@ -1199,11 +1199,18 @@ class ProcessEngine:
             reason = f"{type(exc).__name__}: {exc}"
             if blame:
                 reason = f"{reason} [{blame}]"
-            state = cov.fail(key, cid, reason)
-            self.session["failed"] += 1
-            self._log(f"{key} · {cid}: {type(exc).__name__}: "
-                      f"{str(exc)[:200]}" + (f" — while {blame}" if blame else ""),
-                      "error")
+            if self._is_transient_failure(exc):
+                wait = 45.0 if self._is_oom(exc) else 30.0
+                state = cov.defer(key, cid, reason, wait)
+                self.session["deferred"] = self.session.get("deferred", 0) + 1
+                self._log(f"{key} · {cid}: deferred {wait:.0f}s after transient "
+                          f"{type(exc).__name__}: {str(exc)[:200]}", "warn")
+            else:
+                state = cov.fail(key, cid, reason)
+                self.session["failed"] += 1
+                self._log(f"{key} · {cid}: {type(exc).__name__}: "
+                          f"{str(exc)[:200]}" + (f" — while {blame}" if blame else ""),
+                          "error")
             if self._is_oom(exc):
                 v = ModelCache.vram()
                 self._log(f"Out of VRAM on {cid}"
@@ -1302,6 +1309,18 @@ class ProcessEngine:
         return ("OutOfMemory" in name
                 or "CUDA out of memory" in str(exc)
                 or "CUBLAS_STATUS_ALLOC_FAILED" in str(exc))
+
+    @classmethod
+    def _is_transient_failure(cls, exc: Exception) -> bool:
+        """Failures worth requeueing without poisoning stage error totals."""
+        if cls._is_oom(exc):
+            return True
+        text = f"{type(exc).__name__}: {exc}".lower()
+        return any(token in text for token in (
+            "invalid device ordinal", "cudaerror", "cublas_status",
+            "connection reset", "connection refused", "timed out",
+            "timeout", "temporarily unavailable", "503", "502", "429",
+            "rate limit", "too many requests", "download failed"))
 
     def _loading_blame(self, exc: Exception, since: float) -> str:
         """"loading <key>", when this failure came out of a model load.

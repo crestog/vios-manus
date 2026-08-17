@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS observer (
 CREATE TABLE IF NOT EXISTS claim (
     id          INTEGER PRIMARY KEY,
     uid         TEXT NOT NULL UNIQUE,
+    canonical_uid TEXT,           -- observer-independent evidence identity
     video_key   TEXT NOT NULL,
     shot_idx    INTEGER,          -- NULL = a claim about the whole video
     t0          REAL,             -- derived from shot; never model-supplied
@@ -270,12 +271,14 @@ END;
 MIGRATIONS = (
     ("claim", "frame_idx", "INTEGER"),
     ("claim", "frame_hi", "INTEGER"),
+    ("claim", "canonical_uid", "TEXT"),
 )
 
 # Built after the migration, for the same reason.
 LATE_INDEXES = """
 CREATE INDEX IF NOT EXISTS ix_claim_frame ON claim(video_key, frame_idx);
 CREATE INDEX IF NOT EXISTS ix_claim_frun  ON claim(video_key, frame_idx, frame_hi);
+CREATE INDEX IF NOT EXISTS ix_claim_canonical ON claim(video_key, canonical_uid);
 """
 
 
@@ -791,13 +794,16 @@ class Store:
             # every claim written by v1 hashes to exactly the same value under
             # v2 and shard replay stays idempotent across the version boundary.
             if fi is None:
-                uid = _uid(video_key, observer_id, ch, c.get("kind", ""), si,
-                           ordinal)
+                identity = (video_key, ch, c.get("kind", ""), si, ordinal)
+                uid = _uid(video_key, observer_id, *identity)
             else:
-                uid = _uid(video_key, observer_id, ch, c.get("kind", ""), si,
-                           ordinal, "f", fi, fhi)
+                identity = (video_key, ch, c.get("kind", ""), si, ordinal,
+                            "f", fi, fhi)
+                uid = _uid(video_key, observer_id, *identity)
+            canonical_uid = _uid(*identity)
             rows.append((
-                uid, video_key, si, t0, t1, ch, str(c.get("kind", "")),
+                uid, canonical_uid, video_key, si, t0, t1, ch,
+                str(c.get("kind", "")),
                 None if val is None else str(val),
                 c.get("num"), float(c.get("confidence", 1.0)),
                 observer_id, ordinal, now, fi, fhi))
@@ -808,10 +814,10 @@ class Store:
         # them — it reported 17 for 3 claims. rowcount counts only the rows the
         # statement itself inserted, which is what "how many were new" means.
         cur = self.conn.executemany(
-            "INSERT OR IGNORE INTO claim(uid,video_key,shot_idx,t0,t1,channel,"
-            "kind,value,num,confidence,observer_id,ordinal,created_at,"
-            "frame_idx,frame_hi) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            "INSERT OR IGNORE INTO claim(uid,canonical_uid,video_key,shot_idx,"
+            "t0,t1,channel,kind,value,num,confidence,observer_id,ordinal,"
+            "created_at,frame_idx,frame_hi) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         written = max(cur.rowcount, 0)
         self.conn.commit()
         return written
@@ -843,6 +849,35 @@ class Store:
                 sql += f" AND {col}=?"
                 args.append(val)
         sql += " ORDER BY shot_idx, ordinal, id LIMIT ?"
+        args.append(limit)
+        return [dict(r) for r in self.conn.execute(sql, args)]
+
+    def canonical_claims(self, video_key: str, channel: str = "", kind: str = "",
+                        limit: int = 2000) -> list:
+        """Return one best claim per observer-independent evidence identity."""
+        sql = """
+            SELECT c.* FROM claim c
+            WHERE c.video_key=?
+              AND NOT EXISTS (
+                SELECT 1 FROM claim newer
+                WHERE newer.video_key=c.video_key
+                  AND COALESCE(newer.canonical_uid, newer.uid) =
+                      COALESCE(c.canonical_uid, c.uid)
+                  AND (newer.confidence > c.confidence OR
+                       (newer.confidence = c.confidence AND
+                        newer.created_at > c.created_at) OR
+                       (newer.confidence = c.confidence AND
+                        newer.created_at = c.created_at AND newer.id > c.id))
+              )
+        """
+        args: list = [video_key]
+        if channel:
+            sql += " AND c.channel=?"
+            args.append(channel)
+        if kind:
+            sql += " AND c.kind=?"
+            args.append(kind)
+        sql += " ORDER BY c.shot_idx, c.ordinal, c.id LIMIT ?"
         args.append(limit)
         return [dict(r) for r in self.conn.execute(sql, args)]
 

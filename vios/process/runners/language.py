@@ -732,6 +732,12 @@ def text_embed(job: Job) -> Emission:
     for row in job.claims("ocr", "text"):
         if row.get("value"):
             passages.append((row.get("shot_idx"), str(row["value"])))
+    for row in job.claims("visual", "shot_description"):
+        if row.get("value"):
+            passages.append((row.get("shot_idx"), str(row["value"])))
+    for row in job.claims("visual", "subject") + job.claims("visual", "setting") + job.claims("visual", "action"):
+        if row.get("value"):
+            passages.append((row.get("shot_idx"), str(row["value"])))
     for row in job.claims("narrative", "beat") + job.claims("narrative", "hook"):
         if row.get("value"):
             passages.append((row.get("shot_idx"), str(row["value"])))
