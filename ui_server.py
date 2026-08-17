@@ -579,8 +579,15 @@ async def background_downloader():
                 sync_category_queue()
 
                 async with aiosqlite.connect(DB_PATH, timeout=20) as conn:
-                    async with conn.execute("SELECT video_id, category_id FROM posts WHERE status = 'Metadata_Only' ORDER BY video_id DESC") as cursor:
+                    async with conn.execute(
+                        "SELECT p.video_id, p.category_id FROM posts p "
+                        "LEFT JOIN capture_retries r ON r.video_id = p.video_id "
+                        "WHERE p.status = 'Metadata_Only' "
+                        "AND COALESCE(r.terminal, 0) = 0 "
+                        "AND COALESCE(r.next_try_at, 0) <= ? "
+                        "ORDER BY p.video_id DESC", (time.time(),)) as cursor:
                         pending = await cursor.fetchall()
+
                     if not pending:
                         GLOBAL_STATUS = "✅ Sync Complete! Queue empty."
                         custom_print("✅ Sync Complete. Downloader going to sleep.")
@@ -627,6 +634,7 @@ async def background_downloader():
 
                     async with aiosqlite.connect(DB_PATH, timeout=20) as conn:
                         await conn.execute("UPDATE posts SET local_video_path = ?, status = 'Harvested' WHERE video_id = ?", (target_video, target_vid))
+                        await conn.execute("DELETE FROM capture_retries WHERE video_id = ?", (target_vid,))
                         await conn.commit()
                     # A new playable video must appear in the feed at once, not
                     # after the read cache expires.
@@ -659,15 +667,48 @@ async def background_downloader():
 
                     await asyncio.sleep(4)
 
-                except FloodWait as e: 
-                    custom_print(f"⚠️ FloodWait: Sleeping for {e.value}s")
-                    await asyncio.sleep(e.value + 2)
-                except Exception as e:
-                    custom_print(f"⚠️ Network Error on #{target_vid}: {str(e)[:50]}")
+                except FloodWait as e:
+                    wait = max(1, int(getattr(e, "value", 30)))
+                    custom_print(f"⚠️ FloodWait on #{target_vid}: retrying after {wait}s")
                     async with aiosqlite.connect(DB_PATH, timeout=20) as conn:
-                        await conn.execute("UPDATE posts SET status = 'Error' WHERE video_id = ?", (target_vid,))
+                        await conn.execute(
+                            "INSERT INTO capture_retries(video_id, attempts, next_try_at, "
+                            "last_error, updated_at, terminal) VALUES(?,?,?,?,?,0) "
+                            "ON CONFLICT(video_id) DO UPDATE SET attempts=attempts+1, "
+                            "next_try_at=excluded.next_try_at, last_error=excluded.last_error, "
+                            "updated_at=excluded.updated_at, terminal=0",
+                            (target_vid, 1, time.time() + wait,
+                             f"FloodWait: retry after {wait}s", time.time()))
                         await conn.commit()
-                    await asyncio.sleep(15)
+                    await asyncio.sleep(min(wait + 2, 120))
+                except Exception as e:
+                    detail = f"{type(e).__name__}: {str(e)[:240]}"
+                    low = detail.lower()
+                    terminal = any(token in low for token in (
+                        "peer id invalid", "forbidden", "not enough rights",
+                        "channel private", "chat not found", "user deactivated"))
+                    async with aiosqlite.connect(DB_PATH, timeout=20) as conn:
+                        async with conn.execute(
+                                "SELECT attempts FROM capture_retries WHERE video_id = ?",
+                                (target_vid,)) as cursor:
+                            row = await cursor.fetchone()
+                        attempts = int(row[0] or 0) + 1 if row else 1
+                        wait = min(3600, max(15, 2 ** min(attempts, 8)))
+                        await conn.execute(
+                            "INSERT INTO capture_retries(video_id, attempts, next_try_at, "
+                            "last_error, updated_at, terminal) VALUES(?,?,?,?,?,?) "
+                            "ON CONFLICT(video_id) DO UPDATE SET attempts=excluded.attempts, "
+                            "next_try_at=excluded.next_try_at, last_error=excluded.last_error, "
+                            "updated_at=excluded.updated_at, terminal=excluded.terminal",
+                            (target_vid, attempts, 0 if terminal else time.time() + wait,
+                             detail, time.time(), int(terminal)))
+                        await conn.commit()
+                    if terminal:
+                        custom_print(f"⛔ Download #{target_vid} terminal: {detail}")
+                    else:
+                        custom_print(f"⚠️ Download #{target_vid} deferred: {detail}; "
+                                     f"retry {attempts} in {wait}s")
+                    await asyncio.sleep(min(wait, 60))
 
         except Exception as e:
             # This used to swallow the error in silence: it set GLOBAL_STATUS,

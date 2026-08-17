@@ -43,6 +43,14 @@ _TABLES = (
     # forever, so each scan re-fetched them and replayed the whole history.
     "CREATE TABLE IF NOT EXISTS scanned_ids (video_id INTEGER PRIMARY KEY)",
 
+    # Download failures are durable and retryable. Keeping this separate from
+    # `posts.status` lets a transient Telegram/network error remain discoverable
+    # without presenting it as a terminal processing failure.
+    "CREATE TABLE IF NOT EXISTS capture_retries "
+    "(video_id INTEGER PRIMARY KEY, attempts INTEGER DEFAULT 0, "
+    "next_try_at REAL DEFAULT 0, last_error TEXT, updated_at REAL, "
+    "terminal INTEGER DEFAULT 0)",
+
     "CREATE TABLE IF NOT EXISTS videos "
     "(msg_id INTEGER PRIMARY KEY, folder_id TEXT, title TEXT, "
     "frames INTEGER, duration_sec REAL, duration_str TEXT, "
@@ -85,6 +93,7 @@ _TRIGGERS = (
 # key — that is the bulk of what the UI shows as "buffering".
 _INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_posts_have_file ON posts(local_video_path)",
+    "CREATE INDEX IF NOT EXISTS idx_capture_retry_due ON capture_retries(next_try_at, terminal)",
     "CREATE INDEX IF NOT EXISTS idx_posts_category  ON posts(category_id)",
     "CREATE INDEX IF NOT EXISTS idx_posts_creator   ON posts(creator_id)",
     "CREATE INDEX IF NOT EXISTS idx_transcripts_msg ON transcripts(msg_id)",
