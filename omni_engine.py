@@ -1540,8 +1540,44 @@ async def handle_callback(client, callback_query: CallbackQuery):
     await callback_query.message.edit_text("🚀 Injecting into Layer 5 Queues (PRIORITY)...")
 
 
+async def _atlas_search_text(query: str) -> str:
+    """Search Atlas in a worker thread and format a compact Telegram answer."""
+    import asyncio
+
+    def run():
+        try:
+            from atlas import ingest as atlas_ingest, search as atlas_search
+            conn = atlas_ingest.connect()
+            atlas_ingest.ensure_meta(conn)
+            out = atlas_search.search(conn, query, limit=8, offset=0)
+            rows = out.get("results") or []
+            if not rows:
+                return f"No Atlas matches for: {query}"
+            lines = [f"Atlas results for: {query}"]
+            for row in rows:
+                title = row.get("title") or row.get("video_key")
+                best = row.get("best") or {}
+                t0 = best.get("t_start")
+                stamp = f" @ {float(t0):.1f}s" if t0 is not None else ""
+                lines.append(f"• {title}{stamp} — {best.get('text', '')[:220]}")
+            return "\\n".join(lines)
+        except Exception as exc:
+            return f"Atlas search unavailable: {type(exc).__name__}: {str(exc)[:180]}"
+
+    return await asyncio.to_thread(run)
+
+
+@app.on_message(filters.command(["atlas", "search"]) & filters.private)
+async def handle_atlas_search(client, message):
+    query = " ".join((getattr(message, "command", None) or [])[1:]).strip()
+    if not query:
+        return await message.reply_text("Usage: /atlas <query>")
+    status_msg = await message.reply_text("Searching Atlas…")
+    await status_msg.edit_text(await _atlas_search_text(query))
+
+
 @app.on_message(filters.private & filters.text &
-                ~filters.command(["start", "status", "purge_cache", "freeze", "awaken"]))
+                ~filters.command(["start", "status", "purge_cache", "freeze", "awaken", "atlas", "search"]))
 async def handle_search(client, message):
     raw_query = message.text
     status_msg = await message.reply_text(
@@ -1550,7 +1586,7 @@ async def handle_search(client, message):
     try:
         qdrant = get_qdrant()
         if not qdrant:
-            return await status_msg.edit_text("🚫 **Vector store offline.** Try again shortly.")
+            return await status_msg.edit_text(await _atlas_search_text(raw_query))
 
         # ── 1. NIM query rewrite (graceful fallback to raw query) ──
         try:

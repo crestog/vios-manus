@@ -36,7 +36,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                Response, StreamingResponse)
 
 from . import (config, graph, index, ingest, maps, media, reflect, roadmap,
-               search)
+               search, visual)
 from .tgchannel import log, recent_log
 
 BOOT_T0 = time.time()
@@ -591,6 +591,35 @@ def api_suggest(q: str = "", limit: int = 8):
 @app.get("/api/similar/{video_key}")
 def api_similar(video_key: str, limit: int = 12):
     return {"results": search.similar(db(), video_key, limit)}
+
+
+@app.post("/api/reverse-frame")
+async def api_reverse_frame(request: Request, limit: int = 24,
+                            space: str = "clip"):
+    """Find indexed moments that visually resemble an uploaded frame."""
+    if space not in ("clip", "siglip2", "siglip"):
+        space = "clip"
+    raw = await request.body()
+    if not raw:
+        return JSONResponse({"ok": False, "error": "empty image upload"},
+                            status_code=400)
+    if len(raw) > 12 * 1024 * 1024:
+        return JSONResponse({"ok": False, "error": "image exceeds 12 MB"},
+                            status_code=413)
+    os.makedirs(config.CACHE_DIR, exist_ok=True)
+    safe = os.path.basename(request.headers.get("x-filename") or "query.jpg")
+    path = os.path.join(config.CACHE_DIR,
+                        f"reverse-query-{threading.get_ident()}-{safe}")
+    try:
+        with open(path, "wb") as fh:
+            fh.write(raw)
+        return visual.reverse_frame(db(), path, limit=max(1, min(int(limit), 100)),
+                                    space=space)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 # ── library ───────────────────────────────────────────────────────────────
