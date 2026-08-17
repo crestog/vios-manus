@@ -182,8 +182,12 @@ def _safe(key: str) -> str:
 class ProcessEngine:
     """One instance per process. Configure it, start it, watch it, stop it."""
 
-    def __init__(self, base_dir: str | None = None):
+    def __init__(self, base_dir: str | None = None,
+                 gpu_index: int | None = None,
+                 publish_enabled: bool = True):
         self.base = base_dir or _default_base()
+        self.gpu_index = (None if gpu_index is None else int(gpu_index))
+        self.publish_enabled = bool(publish_enabled)
         self.root = os.path.join(self.base, "process")
         self.db_path = os.path.join(self.root, "evidence.db")
         self.cache_dir = os.path.join(_default_scratch(self.base), "process")
@@ -470,6 +474,7 @@ class ProcessEngine:
             "db_path": self.db_path,
             "cache_dir": self.cache_dir,
             "worker": self.worker,
+            "gpu_lane": self.gpu_index,
         }
 
     # ══════════════════════════════════════════════════════════════════════
@@ -542,6 +547,8 @@ class ProcessEngine:
 
         # ── hardware ─────────────────────────────────────────────────────
         res = resources.probe(self.cache_dir)
+        if self.gpu_index is not None:
+            res = resources.pin(res, self.gpu_index)
         self.resources = res
         ok("Hardware", True, resources.describe(res))
         ok("Scratch disk", res["disk_free_mb"] > self.disk_floor_mb,
@@ -623,6 +630,8 @@ class ProcessEngine:
         """What this machine would do, without doing it. Drives the tab's
         cohort strip and the 'what am I about to start' numbers."""
         res = self.resources or resources.probe(self.cache_dir)
+        if self.gpu_index is not None and not res.get("lane"):
+            res = resources.pin(res, self.gpu_index)
         sel = list(self.selected)
         cannot = registry.unrunnable(sel, res)
         runnable = [c for c in sel if c not in cannot]
@@ -810,6 +819,8 @@ class ProcessEngine:
 
         while not self._stopping():
             res = resources.probe(self.cache_dir)
+            if self.gpu_index is not None:
+                res = resources.pin(res, self.gpu_index)
             with self._lock:
                 self.resources = res
             self._log(resources.describe(res))
@@ -1021,6 +1032,28 @@ class ProcessEngine:
         return worked
 
     # ── one video, every resident pass ───────────────────────────────────
+    def _ensure_lane_source(self, video: dict, workdir: str,
+                            prefetched=None) -> str:
+        if self.gpu_index != 1:
+            return (prefetched.result() if prefetched is not None else
+                    self._source.ensure(video, workdir))
+        # GPU1 is the language lane. GPU0 owns acquisition and structural
+        # artifacts; waiting here prevents duplicate MTProto downloads and lets
+        # both lanes consume one immutable source workspace.
+        dest = os.path.join(workdir, "source.mp4")
+        deadline = time.time() + float(os.environ.get(
+            "VIOS_GPU_LANE_SOURCE_WAIT_SECONDS", "180"))
+        while not self._stopping() and time.time() < deadline:
+            try:
+                if os.path.isfile(dest) and os.path.getsize(dest) > 4096:
+                    return dest
+            except OSError:
+                pass
+            time.sleep(0.5)
+        # If the producer lane is unavailable, retain standalone correctness by
+        # falling back to the normal source path rather than failing silently.
+        return self._source.ensure(video, workdir)
+
     def _process_video(self, key: str, ids: list, cohort,
                        prefetched=None) -> bool:
         cov, store = self.coverage, self.store
@@ -1041,8 +1074,7 @@ class ProcessEngine:
                             "since": started, "passes": len(order)}
 
         try:
-            source = (prefetched.result() if prefetched is not None else
-                      self._source.ensure(video, workdir))
+            source = self._ensure_lane_source(video, workdir, prefetched)
         except intake.SourceError as exc:
             for cid in order:
                 cov.fail(key, cid, str(exc))
@@ -1541,6 +1573,8 @@ class ProcessEngine:
         checkpoints, so the maximum loss is bounded by time rather than by how
         many reels happened to fit in a cohort.
         """
+        if not self.publish_enabled:
+            return False
         with self._lock:
             n = self.since_publish
             last = self.last_publish or 0.0
@@ -1561,6 +1595,8 @@ class ProcessEngine:
         with its watermark unmoved, so the next attempt includes it rather than
         losing it.
         """
+        if not self.publish_enabled:
+            return ""
         store = self.store
         with self._lock:
             lo_id = int(store.get_meta("shard_lo_id", "0") or 0)
@@ -1826,6 +1862,9 @@ class ProcessEngine:
         running.
         """
         out = {"stage": stage, "ok": False, "reason": ""}
+        if not self.publish_enabled:
+            out["reason"] = "lane is not the publisher"
+            return out
         try:
             report = self.coverage.stage_report(stage, components)
         except Exception as exc:                # noqa: BLE001
@@ -2062,6 +2101,9 @@ class ProcessEngine:
     # ══════════════════════════════════════════════════════════════════════
 
     def _open_channel(self) -> None:
+        if self.gpu_index == 1:
+            self._log("GPU1 language lane: reusing GPU0 capture and restore state")
+            return
         if not (self._tg and self._tg.token):
             self._log("No Telegram credentials — running locally only", "warn")
             return
@@ -2453,8 +2495,8 @@ _engine: ProcessEngine | None = None
 _engine_lock = threading.Lock()
 
 
-def get_engine(base_dir: str | None = None) -> ProcessEngine:
-    """One engine per process, created on first use.
+def get_engine(base_dir: str | None = None):
+    """One processing coordinator per process, created on first use.
 
     Guarded because Flask serves requests on threads: two simultaneous hits on
     the tab at startup would otherwise build two engines, two stores and two
@@ -2464,5 +2506,14 @@ def get_engine(base_dir: str | None = None) -> ProcessEngine:
     global _engine
     with _engine_lock:
         if _engine is None:
-            _engine = ProcessEngine(base_dir)
+            try:
+                from .lanes import DualGpuCoordinator, dual_gpu_available
+                if dual_gpu_available():
+                    _engine = DualGpuCoordinator(base_dir)
+                else:
+                    _engine = ProcessEngine(base_dir)
+            except Exception:
+                # The single engine remains the safe compatibility path on
+                # CPU-only hosts or stripped web environments.
+                _engine = ProcessEngine(base_dir)
         return _engine

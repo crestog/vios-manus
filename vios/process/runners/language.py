@@ -166,7 +166,9 @@ def _vlm(job: Job) -> dict:
         kwargs = {"torch_dtype": torch_dtype(dtype) if device == "cuda"
                   else torch.float32, "trust_remote_code": True}
         if device == "cuda":
-            kwargs["device_map"] = "auto"
+            lane = job.resources.get("gpu_index")
+            kwargs["device_map"] = ({"": f"cuda:{int(lane)}"}
+                                     if lane is not None else "auto")
         last = None
         for name in ("Qwen3VLForConditionalGeneration",
                      "AutoModelForImageTextToText",
@@ -630,7 +632,9 @@ def concepts(job: Job) -> Emission:
         kwargs = {"torch_dtype": torch_dtype(dtype) if device == "cuda"
                   else torch.float32, "trust_remote_code": True}
         if device == "cuda":
-            kwargs["device_map"] = "auto"
+            lane = job.resources.get("gpu_index")
+            kwargs["device_map"] = ({"": f"cuda:{int(lane)}"}
+                                     if lane is not None else "auto")
         model = AutoModelForCausalLM.from_pretrained(comp.model, **kwargs)
         model.eval()
         tok = AutoTokenizer.from_pretrained(comp.model, trust_remote_code=True)

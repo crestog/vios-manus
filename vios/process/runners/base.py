@@ -915,6 +915,16 @@ def device_and_dtype(resources: dict) -> tuple:
     """
     if not resources.get("gpu_count"):
         return "cpu", "float32"
+    lane = resources.get("gpu_index")
+    if lane is not None:
+        try:
+            import torch  # noqa: PLC0415
+            if torch.cuda.is_available():
+                torch.cuda.set_device(int(lane))
+        except Exception:
+            # The engine records the model failure with the lane metadata; do
+            # not make a web-only import fail merely because torch is absent.
+            pass
     return "cuda", resources.get("dtype", "float16")
 
 

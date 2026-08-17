@@ -190,6 +190,30 @@ def probe(scratch: str = ".") -> dict:
     }
 
 
+def pin(res: dict, gpu_index: int | None) -> dict:
+    """Return a lane view of the probed machine without renumbering the card."""
+    if gpu_index is None:
+        return dict(res)
+    cards = [g for g in (res.get("gpus") or [])
+             if int(g.get("index", -1)) == int(gpu_index)]
+    if not cards:
+        raise ValueError(f"GPU lane {gpu_index} is not present")
+    card = cards[0]
+    usable = max(int(card.get("free_mb", 0)) - VRAM_HEADROOM_MB, 0)
+    out = dict(res)
+    out.update({
+        "gpus": [card],
+        "gpu_count": 1,
+        "gpu_index": int(gpu_index),
+        "vram_total_mb": int(card.get("total_mb", 0)),
+        "vram_free_mb": int(card.get("free_mb", 0)),
+        "usable_vram_mb": usable,
+        "usable_vram_total_mb": usable,
+        "lane": int(gpu_index),
+    })
+    return out
+
+
 def describe(res: dict) -> str:
     """One line for the log and the tab's header."""
     ram = (f"{res['ram_available_mb'] / 1024:.1f} GB RAM"

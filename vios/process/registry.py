@@ -87,6 +87,7 @@ class Component:
 
     device: str = "cpu"              # cpu | gpu
     cards: int = 1                   # 2 means it must be sharded across both T4s
+    gpu_lane: int | None = None      # explicit physical GPU affinity, if any
     vram_mb: int = 0
     ram_mb: int = 512
     disk_mb: int = 0                 # weights to download, for the disk check
@@ -669,7 +670,7 @@ _LANGUAGE = [
             "about shot 3, not about 00:07, because it is not able to know what "
             "00:07 is and will invent it if asked."),
         model="Qwen/Qwen3-VL-8B-Instruct-AWQ", weights=_VLM, quant="awq",
-        device="gpu", vram_mb=6200, disk_mb=6000, seconds=18.0, ram_mb=3072,
+        device="gpu", gpu_lane=1, vram_mb=6200, disk_mb=6000, seconds=18.0, ram_mb=3072,
         needs=("keyframes", "shots"), requires=("transformers", "torch"),
         kinds=("shot_description", "subject", "setting", "action"),
         params={"max_shots_per_call": 6, "max_new_tokens": 320,
@@ -688,7 +689,7 @@ _LANGUAGE = [
             "and pattern recognition, and it is deliberately last, because it "
             "reads everything the earlier passes produced."),
         model="Qwen/Qwen3-VL-8B-Instruct-AWQ", weights=_VLM, quant="awq",
-        device="gpu", vram_mb=6200, disk_mb=0, seconds=20.0, ram_mb=3072,
+        device="gpu", gpu_lane=1, vram_mb=6200, disk_mb=0, seconds=20.0, ram_mb=3072,
         needs=("describe", "transcribe", "ocr", "loudness", "cuts"),
         requires=("transformers", "torch"),
         kinds=("hook", "beat", "turn", "payoff", "premise", "why_it_works",
@@ -706,7 +707,7 @@ _LANGUAGE = [
             "what stops it becoming film-school vocabulary applied at random; "
             "every stylistic claim it makes has arithmetic sitting under it."),
         model="Qwen/Qwen3-VL-8B-Instruct-AWQ", weights=_VLM, quant="awq",
-        device="gpu", vram_mb=6200, disk_mb=0, seconds=12.0, ram_mb=3072,
+        device="gpu", gpu_lane=1, vram_mb=6200, disk_mb=0, seconds=12.0, ram_mb=3072,
         needs=("describe", "colour", "motion", "cuts"),
         requires=("transformers", "torch"),
         kinds=("technique", "lighting", "grade", "framing", "edit_style",
@@ -736,7 +737,7 @@ _LANGUAGE = [
             "keyphrase extractor support become graph nodes; the rest are kept "
             "as claims but do not get to shape the structure."),
         model="Qwen/Qwen3-4B-Instruct-AWQ", weights="qwen3-4b-awq", quant="awq",
-        device="gpu", vram_mb=3400, disk_mb=3000, seconds=8.0,
+        device="gpu", gpu_lane=1, vram_mb=3400, disk_mb=3000, seconds=8.0,
         needs=("transcribe", "ocr", "caption", "keyphrase"),
         requires=("transformers", "torch"),
         kinds=("entity", "topic", "technique", "claim_span", "unsupported"),
