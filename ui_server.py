@@ -1026,6 +1026,49 @@ def _worker_health() -> dict:
             "note": ", ".join(notes)}
 
 
+def _port_ready(host: str, port: int, timeout: float = 0.25) -> bool:
+    try:
+        import socket
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+@app.get("/api/health")
+def api_health():
+    """Stable readiness contract for the parent gateway and dashboards.
+
+    This endpoint intentionally reports degraded states as JSON rather than
+    raising a proxy exception. A healthy UI is useful even when optional model,
+    graph, or Telegram services are warming or unavailable.
+    """
+    workers = _worker_health()
+    try:
+        redis_ok = bool(REDIS_CACHE and REDIS_CACHE.ping())
+    except Exception:
+        redis_ok = False
+    omni_port = _port_ready("127.0.0.1", OMNI_DASHBOARD_PORT)
+    telegram_ready = not bool(missing_telegram_secrets())
+    services = {
+        "ui": {"state": "ready"},
+        "redis": {"state": "ready" if redis_ok else "degraded"},
+        "watchdog": {"state": workers.get("state", "unknown"),
+                     "stale": workers.get("stale", False)},
+        "omni": {"state": ("ready" if omni_port else
+                             "starting" if OMNI_ENABLED else "disabled"),
+                 "dashboard_only": bool(OMNI_DASHBOARD_ONLY)},
+        "telegram": {"state": "ready" if telegram_ready else "disabled"},
+    }
+    states = [v["state"] for v in services.values()]
+    overall = ("failed" if workers.get("state") == "failed" or not redis_ok
+               else "degraded" if "degraded" in states or "starting" in states
+               else "ready")
+    return {"ok": overall != "failed", "state": overall,
+            "at": time.time(), "status": GLOBAL_STATUS,
+            "services": services, "workers": workers}
+
+
 @app.get("/api/status")
 def get_status():
     """Polled every 1.5s per open tab, so it must be nearly free.
