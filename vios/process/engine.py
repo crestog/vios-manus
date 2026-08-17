@@ -54,7 +54,7 @@ import traceback
 from collections import deque
 
 from . import intake, media, registry, resources
-from .. import creds as _creds
+from .. import creds as _creds, observability
 from .coverage import Coverage, worker_id
 from .runners import get as get_runner
 from .runners import missing as missing_runners
@@ -1096,8 +1096,17 @@ class ProcessEngine:
                 cov.release(key, cid)
                 continue
             self._wait_if_paused()
+            pass_started = time.perf_counter()
             states[cid] = self._run_pass(key, cid, video, source, workdir,
                                          states, cohort)
+            observability.observe(
+                "vios_pass_seconds", time.perf_counter() - pass_started,
+                component=cid, lane=(self.gpu_index if self.gpu_index is not None else "single"),
+                outcome=states[cid])
+            observability.increment(
+                "vios_pass_total", component=cid,
+                lane=(self.gpu_index if self.gpu_index is not None else "single"),
+                outcome=states[cid])
 
         self.session["videos"] += 1
         self.session["seconds"] += time.time() - started

@@ -1139,6 +1139,19 @@ def api_health():
             "services": services, "workers": workers}
 
 
+@app.get("/api/metrics")
+def api_metrics():
+    """Operational metrics for a scraper or the operator dashboard."""
+    from vios import observability
+    extra = {"queues": {}}
+    for queue in ("QUEUE_VISION", "QUEUE_OMNI_VISION", "QUEUE_OMNI_ORACLE"):
+        try:
+            extra["queues"][queue] = get_queue_metrics(queue)
+        except Exception:
+            extra["queues"][queue] = {"state": "unavailable"}
+    return observability.snapshot(extra)
+
+
 @app.get("/api/status")
 def get_status():
     """Polled every 1.5s per open tab, so it must be nearly free.
