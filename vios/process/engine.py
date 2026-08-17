@@ -43,6 +43,7 @@ mid-sweep, the next one re-reads the shards and continues.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -1599,19 +1600,26 @@ class ProcessEngine:
                               f"{type(exc).__name__}: {exc}", "warn")
 
             store.note_shard(sid, note, msg_id, stats)
-            # Only advance the watermark once the rows are safely in a file.
-            # If the upload failed the shard is still on local disk and still
-            # counted, which is the honest state: exported, not yet published.
-            store.set_meta("shard_lo_id", str(stats["hi_id"]))
-            store.set_meta("shard_lo_vec", str(stats["hi_vec"]))
-            store.set_meta("shard_lo_fvec", str(stats["hi_fvec"]))
-            store.set_meta("shard_lo_fmet", str(stats["hi_fmet"]))
-            store.set_meta("shard_seq", str(seq))
-            store.checkpoint()
-
-            self.since_publish = 0
+            uploaded = msg_id is not None
+            has_telegram = bool(self._tg and self._tg.token)
+            if uploaded or not has_telegram:
+                # The local shard file is durable enough for a deliberately
+                # offline run. When Telegram credentials exist, however, the
+                # remote channel is the disaster-recovery source and the
+                # watermark must not pass an unverified upload failure.
+                store.set_meta("shard_lo_id", str(stats["hi_id"]))
+                store.set_meta("shard_lo_vec", str(stats["hi_vec"]))
+                store.set_meta("shard_lo_fvec", str(stats["hi_fvec"]))
+                store.set_meta("shard_lo_fmet", str(stats["hi_fmet"]))
+                store.set_meta("shard_seq", str(seq))
+                store.checkpoint()
+                self.since_publish = 0
+                self.session["shards"] += 1
+            else:
+                self.last_publish = time.time()
+                self._log(f"Shard {sid} retained locally — Telegram upload failed; "
+                          "watermark unchanged", "warn")
             self.last_publish = time.time()
-            self.session["shards"] += 1
             self._log(f"Shard {sid}: {stats['claims']} claims, "
                       f"{stats['vectors']} vectors, "
                       f"{stats['frame_vectors']} frame-vector rows, "
@@ -1670,6 +1678,14 @@ class ProcessEngine:
         return (f"{STAGE_PREFIX}{intake.site_id(self.store)}-{stage}-"
                 f"{seq:04d}.tar.gz")
 
+    @staticmethod
+    def _file_sha256(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for block in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
     def _build_stage_bundle(self, stage: str, report: dict, path: str) -> dict:
         """Snapshot the database and the stage report into one gzip tarball.
 
@@ -1705,17 +1721,34 @@ class ProcessEngine:
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, default=str)
 
+        bundle_meta_path = os.path.join(work, "bundle.json")
+        bundle_meta = {
+            "schema": "vios.stage_bundle",
+            "version": 2,
+            "stage": stage,
+            "created_at": time.time(),
+            "files": {
+                "stage.json": {"bytes": os.path.getsize(meta_path),
+                               "sha256": self._file_sha256(meta_path)},
+                "evidence.sqlite": {"bytes": os.path.getsize(snap),
+                                    "sha256": self._file_sha256(snap)},
+            },
+        }
+        with open(bundle_meta_path, "w", encoding="utf-8") as f:
+            json.dump(bundle_meta, f, indent=2, sort_keys=True)
+
         try:
             os.remove(path)
         except OSError:
             pass
         with tarfile.open(path, "w:gz", compresslevel=6) as tar:
+            tar.add(bundle_meta_path, arcname="bundle.json")
             tar.add(meta_path, arcname="stage.json")
             tar.add(snap, arcname="evidence.sqlite")
 
         out = {"bytes": os.path.getsize(path),
                "db_bytes": os.path.getsize(snap)}
-        for p in (snap, meta_path):
+        for p in (snap, meta_path, bundle_meta_path):
             try:
                 os.remove(p)
             except OSError:

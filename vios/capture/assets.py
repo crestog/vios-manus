@@ -81,8 +81,55 @@ CHUNK_PAUSE = float(os.environ.get("VIOS_CHUNK_PAUSE", "0.35"))
 
 UPLOAD_FRAMES = os.environ.get("VIOS_UPLOAD_FRAMES", "0") == "1"
 
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
+
+
+def _manifest_payload(manifest: dict) -> dict:
+    """Return the digestable manifest body without its self-referential hash."""
+    body = dict(manifest or {})
+    body.pop("manifest_digest", None)
+    return body
+
+
+def manifest_digest(manifest: dict) -> str:
+    """Hash the canonical manifest body, independent of JSON whitespace."""
+    raw = json.dumps(_manifest_payload(manifest), ensure_ascii=False,
+                     sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def validate_manifest(manifest: dict) -> tuple[bool, str]:
+    """Validate the asset-set contract before publishing or indexing it."""
+    if not isinstance(manifest, dict):
+        return False, "manifest is not an object"
+    if not str(manifest.get("key") or ""):
+        return False, "manifest has no video key"
+    chunks = manifest.get("chunks") or []
+    seen = set()
+    previous_end = None
+    for pos, chunk in enumerate(chunks):
+        try:
+            seq = int(chunk.get("i"))
+            t0 = float(chunk.get("t0"))
+            t1 = float(chunk.get("t1"))
+        except (AttributeError, TypeError, ValueError):
+            return False, f"chunk {pos} has invalid sequence or time"
+        if seq in seen:
+            return False, f"duplicate chunk sequence {seq}"
+        if t0 < 0 or t1 <= t0:
+            return False, f"chunk {seq} has invalid range {t0}..{t1}"
+        if previous_end is not None and t0 + 0.05 < previous_end:
+            return False, f"chunk {seq} overlaps the previous chunk"
+        name = os.path.basename(str(chunk.get("name") or ""))
+        if not name or name != str(chunk.get("name")):
+            return False, f"chunk {seq} has an unsafe name"
+        seen.add(seq)
+        previous_end = t1
+    expected = manifest.get("manifest_digest")
+    if expected and expected != manifest_digest(manifest):
+        return False, "manifest digest mismatch"
+    return True, ""
 
 
 class AssetError(RuntimeError):
@@ -273,6 +320,7 @@ def build_manifest(key: str, video_part: dict, clips: list, assets: list,
     """
     return {
         "v": MANIFEST_VERSION,
+        "schema": "vios.video_asset_set",
         "key": key,
         "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "duration": round(float(duration), 3) if duration else None,
@@ -409,6 +457,11 @@ def publish_assets(tg, result: dict, sent: dict, key: str, work: str,
                              duration=sent.get("duration"),
                              truncated=out["truncated"],
                              note="; ".join(notes)[:500])
+        ok, why = validate_manifest(man)
+        if not ok:
+            say(f"manifest validation failed: {why}")
+            return out
+        man["manifest_digest"] = manifest_digest(man)
         man_path = os.path.join(work, manifest_name(key))
         with open(man_path, "w", encoding="utf-8") as f:
             json.dump(man, f, ensure_ascii=False, separators=(",", ":"))

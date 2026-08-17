@@ -343,6 +343,41 @@ def ensure_schema(conn: sqlite3.Connection) -> bool:
 # ══════════════════════════════════════════════════════════════════════════
 # ASSET PARTS — the clip index behind instant playback
 # ══════════════════════════════════════════════════════════════════════════
+def _validate_asset_manifest(manifest: dict) -> tuple[bool, str]:
+    """Validate the producer's chunk contract without importing capture code."""
+    if not isinstance(manifest, dict) or not str(manifest.get("key") or ""):
+        return False, "missing asset key"
+    chunks = manifest.get("chunks") or []
+    seen = set()
+    previous_end = None
+    for pos, chunk in enumerate(chunks):
+        try:
+            seq = int(chunk.get("i"))
+            t0 = float(chunk.get("t0"))
+            t1 = float(chunk.get("t1"))
+        except (AttributeError, TypeError, ValueError):
+            return False, f"invalid chunk {pos}"
+        if seq in seen or t0 < 0 or t1 <= t0:
+            return False, f"invalid chunk range {seq}"
+        if previous_end is not None and t0 + 0.05 < previous_end:
+            return False, f"overlapping chunk {seq}"
+        name = str(chunk.get("name") or "")
+        if not name or os.path.basename(name) != name:
+            return False, f"unsafe chunk name {seq}"
+        seen.add(seq)
+        previous_end = t1
+    expected = manifest.get("manifest_digest")
+    if expected:
+        body = dict(manifest)
+        body.pop("manifest_digest", None)
+        raw = json.dumps(body, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"))
+        actual = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        if actual != expected:
+            return False, "manifest digest mismatch"
+    return True, ""
+
+
 def record_parts(conn: sqlite3.Connection, manifest: dict) -> int:
     """Store one video's asset manifest as `parts` rows. Returns rows written.
 
@@ -358,6 +393,10 @@ def record_parts(conn: sqlite3.Connection, manifest: dict) -> int:
     asks for and the routes keep answering 204 with a full `parts` table.
     `UNIQUE(msg_id)` means there can only be one spelling, so it is this one.
     """
+    valid, why = _validate_asset_manifest(manifest)
+    if not valid:
+        log(f"asset manifest rejected — {why}")
+        return 0
     key = reflect.normalize_key(manifest.get("key") or "")
     if not key:
         return 0
@@ -390,6 +429,16 @@ def record_parts(conn: sqlite3.Connection, manifest: dict) -> int:
 
     if not rows:
         return 0
+
+    # A later verified manifest is authoritative for this asset set. Remove
+    # message rows no longer present, which fixes partial-upload replays without
+    # deleting valid rows from other videos.
+    msg_ids = [r[3] for r in rows if r[3]]
+    if msg_ids:
+        placeholders = ",".join("?" for _ in msg_ids)
+        conn.execute(
+            f"DELETE FROM parts WHERE video_key=? AND msg_id NOT IN ({placeholders})",
+            [key] + msg_ids)
     conn.executemany(
         "INSERT OR REPLACE INTO parts (video_key, kind, seq, msg_id, file_id, "
         "name, bytes, sha256, t_start, t_end, chunk_seconds) "
