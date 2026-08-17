@@ -50,6 +50,8 @@ _BOOT = {
     "error": "",
 }
 _BOOT_LOCK = threading.Lock()
+_REFRESH_STARTED = False
+_REFRESH_LOCK = threading.Lock()
 
 
 def _boot_set(**kw):
@@ -187,6 +189,7 @@ def _boot() -> None:
         moments = videos = 0
     _boot_set(phase="ready", ready_at=time.time(),
               detail=f"{moments} passage(s) across {videos} video(s)")
+    start_live_refresh()
     log(f"Atlas ready in {time.time() - BOOT_T0:.1f}s — "
         f"{moments} passage(s), {videos} video(s)")
     conn.close()
@@ -277,6 +280,45 @@ app.add_middleware(_Timing)
 
 def start_boot() -> None:
     threading.Thread(target=_boot, name="atlas-boot", daemon=True).start()
+
+
+def start_live_refresh() -> None:
+    """Keep Atlas current while another plane publishes checkpoints.
+
+    A Kaggle session is disposable, so waiting for the next session's boot scan
+    defeats the point of publishing small evidence shards. The loop is bounded
+    and idempotent: ingest skips messages already held, and the index rebuilds
+    only when rows or the schema fingerprint changed.
+    """
+    global _REFRESH_STARTED
+    if str(os.environ.get("VIOS_ATLAS_LIVE_REFRESH", "1")).strip().lower() in (
+            "0", "false", "no", "off"):
+        return
+    with _REFRESH_LOCK:
+        if _REFRESH_STARTED:
+            return
+        _REFRESH_STARTED = True
+
+    try:
+        interval = max(30.0, float(
+            os.environ.get("VIOS_ATLAS_REFRESH_SECONDS", "120")))
+    except (TypeError, ValueError):
+        interval = 120.0
+
+    def _loop():
+        while True:
+            time.sleep(interval)
+            if boot_phase() != "ready":
+                continue
+            try:
+                if rescan(full=False, max_messages=250):
+                    log("live refresh started — checking the newest "
+                        "evidence checkpoints")
+            except Exception as exc:                  # noqa: BLE001
+                log(f"live refresh skipped — {type(exc).__name__}: {exc}",
+                    "WARN")
+
+    threading.Thread(target=_loop, name="atlas-live-refresh", daemon=True).start()
 
 
 def boot_phase() -> str:

@@ -383,9 +383,15 @@ def narrate(job: Job) -> Emission:
     ev = _evidence(job)
     if not ev["shots"]:
         raise SkipPass("no shots")
-    if not (ev["transcript"] or ev["on_screen"] or ev["caption"]):
-        raise SkipPass("nothing was said, written or captioned — there is no "
-                       "narrative to read")
+    # A silent, text-free video can still have visual narrative: the shot list
+    # and descriptions are evidence too. The old gate turned those videos into
+    # a zero-claim language stage before the VLM ever saw them.
+    visual_evidence = any(
+        line and "no description" not in line.lower()
+        for line in ev["shots"].splitlines())
+    if not (ev["transcript"] or ev["on_screen"] or ev["caption"] or
+            visual_evidence):
+        raise SkipPass("no measured speech, text, caption or visual description")
 
     bundle = _vlm(job)
     p = job.component.params

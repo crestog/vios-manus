@@ -47,6 +47,7 @@ import json
 import os
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import traceback
 from collections import deque
@@ -78,12 +79,12 @@ PUBLISH_EVERY = 1
 # Never upload two shards closer together than this. A shard costs a Telegram
 # round trip and a channel message; below about a minute apart they stop being
 # checkpoints and start being noise.
-PUBLISH_MIN_SECONDS = 90.0
+PUBLISH_MIN_SECONDS = max(15.0, float(os.environ.get("VIOS_PUBLISH_MIN_SECONDS", "30")))
 
 # …and never let unpublished work get older than this, however few videos it
 # came from. This is the number that bounds what a killed Kaggle session
 # actually costs, so it is the one to change if that cost feels wrong.
-PUBLISH_MAX_SECONDS = 600.0
+PUBLISH_MAX_SECONDS = max(PUBLISH_MIN_SECONDS, float(os.environ.get("VIOS_PUBLISH_MAX_SECONDS", "180")))
 
 # One stage bundle part. The Bot API refuses a document over 50 MB and this
 # engine's uploader has no MTProto document path, so a bundle that would exceed
@@ -955,13 +956,12 @@ class ProcessEngine:
 
     # ── one cohort ───────────────────────────────────────────────────────
     def _run_cohort(self, cohort) -> int:
-        """Run every pass in this cohort over every video that still needs one.
+        """Run a cohort while preparing the next source in the background.
 
-        `seen` is why a failure does not become a spin: a video whose pass
-        failed is still claimable — that is the point of retries — and without
-        remembering that it was attempted this cohort, `candidates` would hand
-        it straight back and the loop would grind on the same reel until its
-        attempts ran out. Retries belong to the next rotation, not this one.
+        Model execution remains single-owner and database writes remain in the
+        engine thread. Only the next video's isolated source workspace is
+        prefetched, so a Telegram/MTProto round trip overlaps the current GPU
+        pass instead of leaving the accelerator idle between reels.
         """
         ids = list(cohort.components)
         with self._lock:
@@ -974,27 +974,54 @@ class ProcessEngine:
 
         seen: set = set()
         worked = 0
-        while not self._stopping():
-            self._wait_if_paused()
-            keys = [k for k in self.coverage.candidates(ids, limit=64)
-                    if k not in seen]
-            if not keys:
-                break
-            for key in keys:
-                if self._stopping():
-                    break
+        prefetch = max(0, int(os.environ.get("VIOS_PREFETCH_WORKERS", "1")))
+        pool = ThreadPoolExecutor(max_workers=prefetch,
+                                  thread_name_prefix="vios-prefetch") \
+            if prefetch else None
+        pending = {}
+
+        def queue_source(key: str) -> None:
+            if pool is None or key in pending or key in seen:
+                return
+            video = self.store.video(key)
+            if video is None:
+                return
+            workdir = os.path.join(self.cache_dir, _safe(key))
+            pending[key] = pool.submit(self._source.ensure, video, workdir)
+
+        try:
+            while not self._stopping():
                 self._wait_if_paused()
-                seen.add(key)
-                if self.video_limit and self.session["videos"] >= self.video_limit:
-                    self._log(f"Reached the {self.video_limit}-video limit "
-                              f"for this session")
-                    return worked
-                if self._process_video(key, ids, cohort):
-                    worked += 1
+                keys = [k for k in self.coverage.candidates(ids, limit=64)
+                        if k not in seen]
+                if not keys:
+                    break
+                for pos, key in enumerate(keys):
+                    if self._stopping():
+                        break
+                    self._wait_if_paused()
+                    # Start exactly one download ahead. More than one would
+                    # compete for the same Telegram/API quota and disk cache.
+                    if pos + 1 < len(keys):
+                        queue_source(keys[pos + 1])
+                    seen.add(key)
+                    if self.video_limit and self.session["videos"] >= self.video_limit:
+                        self._log(f"Reached the {self.video_limit}-video limit "
+                                  f"for this session")
+                        return worked
+                    future = pending.pop(key, None)
+                    if self._process_video(key, ids, cohort, prefetched=future):
+                        worked += 1
+        finally:
+            for future in pending.values():
+                future.cancel()
+            if pool is not None:
+                pool.shutdown(wait=True, cancel_futures=True)
         return worked
 
     # ── one video, every resident pass ───────────────────────────────────
-    def _process_video(self, key: str, ids: list, cohort) -> bool:
+    def _process_video(self, key: str, ids: list, cohort,
+                       prefetched=None) -> bool:
         cov, store = self.coverage, self.store
         video = store.video(key)
         if video is None:
@@ -1013,7 +1040,8 @@ class ProcessEngine:
                             "since": started, "passes": len(order)}
 
         try:
-            source = self._source.ensure(video, workdir)
+            source = (prefetched.result() if prefetched is not None else
+                      self._source.ensure(video, workdir))
         except intake.SourceError as exc:
             for cid in order:
                 cov.fail(key, cid, str(exc))
@@ -1591,6 +1619,16 @@ class ProcessEngine:
                       f"{stats['bytes'] / 1024:.0f} KB"
                       + (f" → message {msg_id}" if msg_id else
                          " (held locally — no upload)"))
+            # Atlas can ingest the checkpoint while the processing loop keeps
+            # running. The call is non-blocking: the Atlas scanner owns its own
+            # background thread and refuses a duplicate scan.
+            if msg_id:
+                try:
+                    from atlas import server as _atlas_server
+                    _atlas_server.rescan(full=False, max_messages=250)
+                except Exception as exc:              # noqa: BLE001
+                    self._log(f"Atlas refresh after {sid} deferred: "
+                              f"{type(exc).__name__}: {exc}", "warn")
             if msg_id is None and self._tg and self._tg.token:
                 return ""
             return sid
@@ -1800,17 +1838,23 @@ class ProcessEngine:
 
         parts = self._split_parts(path)
         msg_ids, failed = [], ""
+        total_parts = len(parts)
         for i, part in enumerate(parts):
-            caption = (
-                f"vios stage bundle · {stage} · {intake.site_id(store)}\n"
-                f"{report['videos']} videos · {report['claims']} claims · "
-                f"{report['vectors']} vectors\n"
-                f"{report['counts'].get('done', 0)} done, "
-                f"{report['counts'].get('skipped', 0)} skipped, "
-                f"{report['counts'].get('failed', 0)} failed · "
-                f"{len(report['errors'])} errors\n"
-                f"worker {self.index + 1}/{self.partitions}"
-                + (f" · part {i + 1}/{len(parts)}" if len(parts) > 1 else ""))
+            if i == 0:
+                caption = (
+                    f"📦 vios stage bundle · {stage} · {intake.site_id(store)}\n"
+                    f"{report['videos']} videos · {report['claims']} claims · "
+                    f"{report['vectors']} vectors\n"
+                    f"{report['counts'].get('done', 0)} done, "
+                    f"{report['counts'].get('skipped', 0)} skipped, "
+                    f"{report['counts'].get('failed', 0)} failed · "
+                    f"{len(report['errors'])} errors\n"
+                    f"checkpoint {self.index + 1}/{self.partitions} · "
+                    f"part 1/{total_parts}")
+            else:
+                caption = (f"↳ {stage} bundle {intake.site_id(store)} · "
+                           f"continuation part {i + 1}/{total_parts}\n"
+                           "The summary is attached to part 1.")
             try:
                 res = self._tg.send_document(
                     part, caption, file_name=os.path.basename(part))

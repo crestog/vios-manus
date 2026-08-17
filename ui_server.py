@@ -1108,7 +1108,15 @@ async def omni_proxy(request: Request, path: str = ""):
                                    params=request.query_params,
                                    headers=fwd_headers,
                                    content=await request.body())
-        resp = await client.send(req, stream=True)
+        resp = None
+        for attempt in range(3):
+            try:
+                resp = await client.send(req, stream=True)
+                break
+            except httpx.ConnectError:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(0.5)
         resp_headers = {k: v for k, v in resp.headers.items()
                         if k.lower() not in _HOP_HEADERS}
 

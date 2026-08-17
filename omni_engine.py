@@ -64,6 +64,24 @@ def log(msg, level="INFO"):
     vios_log(msg, "OMNI", level)
 
 
+_OMNI_STATE = {"phase": "starting", "message": "starting", "models": 0,
+              "started_at": time.time(), "ready_at": 0.0}
+_OMNI_STATE_LOCK = threading.Lock()
+
+
+def _set_omni_state(phase: str, message: str = "") -> None:
+    with _OMNI_STATE_LOCK:
+        _OMNI_STATE.update({"phase": phase, "message": message,
+                            "models": len(MODELS),
+                            "ready_at": time.time() if phase == "ready" else
+                            _OMNI_STATE.get("ready_at", 0.0)})
+
+
+def omni_state() -> dict:
+    with _OMNI_STATE_LOCK:
+        return dict(_OMNI_STATE)
+
+
 REDIS = redis_lib.Redis(host="localhost", port=6379, decode_responses=True,
                         socket_timeout=10, socket_connect_timeout=5, retry_on_timeout=True)
 
@@ -938,6 +956,18 @@ def build_dashboard():
         with open(dash_html_path, "r", encoding="utf-8") as f:
             return f.read()
 
+    @app_dashboard.route("/api/health")
+    def health():
+        """Readiness is separate from liveness: the page works while models load."""
+        state = omni_state()
+        try:
+            services = omni_db.service_report()
+        except Exception as exc:                  # noqa: BLE001
+            services = {"error": f"{type(exc).__name__}: {exc}"}
+        return jsonify({"ok": state["phase"] not in ("failed", "stopped"),
+                        "ready": state["phase"] == "ready",
+                        "omni": state, "services": services})
+
     @app_dashboard.route("/api/videos")
     def get_videos():
         """Per-video index with the counts the sidebar actually needs.
@@ -1774,9 +1804,16 @@ def main():
     nest_asyncio.apply()
 
     log("🚀 Omniscient Engine igniting — tri-partite DB + Layer 5 orchestration")
-
+    _set_omni_state("starting", "dashboard binding before model warm-up")
+    # Bind the dashboard first. The old order left /omni returning ConnectError
+    # for the entire model-download window, even though the rest of VIOS was
+    # alive. The page and /api/health are useful while the models are loading.
+    threading.Thread(target=run_dashboard, daemon=True,
+                     name="omni-dashboard").start()
     # 0. Broker first — both worker loops and the bot push jobs immediately.
+    _set_omni_state("broker", "waiting for Redis")
     if not wait_for_redis(label="OMNI"):
+        _set_omni_state("failed", "Redis is unreachable")
         log("❌ Redis unreachable — Omniscient engine cannot run. Exiting.", "ERROR")
         sys.exit(1)
 
@@ -1796,17 +1833,23 @@ def main():
         log(f"Orphan recovery skipped: {e}", "WARN")
 
     # 1. Databases (idempotent service start + schema)
+    _set_omni_state("services", "starting PostgreSQL, Neo4j and Qdrant")
     omni_db.ensure_services()
     omni_db.init_pg_schema()
     get_qdrant()
-
     # 2. Perception models (per-model failure tolerance)
-    omni_models.load_all()
-
-    # 3. Workers + dashboard
-    threading.Thread(target=vision_worker_loop, daemon=True).start()
-    threading.Thread(target=oracle_worker_loop, daemon=True).start()
-    threading.Thread(target=run_dashboard, daemon=True).start()
+    _set_omni_state("models", "warming perception and oracle models")
+    try:
+        omni_models.load_all()
+    except Exception as exc:                      # noqa: BLE001
+        _set_omni_state("degraded", f"model warm-up error: {type(exc).__name__}")
+        log(f"Model warm-up returned an outer error: {exc}", "WARN")
+    _set_omni_state("ready", "dashboard and workers are online")
+    # 3. Workers. The dashboard was already bound before model warm-up.
+    threading.Thread(target=vision_worker_loop, daemon=True,
+                     name="omni-vision").start()
+    threading.Thread(target=oracle_worker_loop, daemon=True,
+                     name="omni-oracle").start()
     log(f"👁️ God-Mode Explorer on 127.0.0.1:{OMNI_DASHBOARD_PORT} → /omni tab in the workstation")
 
     # 4. Telegram bot (main asyncio loop)

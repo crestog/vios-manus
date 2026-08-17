@@ -505,21 +505,15 @@ def ocr(job: Job) -> Emission:
     floor = float(job.component.params.get("min_confidence", 0.6))
 
     def loader():
-        from paddleocr import PaddleOCR  # noqa: PLC0415
         gpu = bool(job.resources.get("gpu_count"))
+        try:
+            from paddleocr import PaddleOCR  # noqa: PLC0415
+        except ImportError:
+            PaddleOCR = None
 
         # PaddleOCR has had three constructor generations and Kaggle's image
-        # pins whichever one it pins this month. 2.x takes use_gpu/show_log;
-        # 3.x removed both and raises ValueError("Unknown argument: use_gpu")
-        # rather than TypeError, which is why the original fallback — an
-        # `except TypeError` — never fired and every OCR pass in the run
-        # declined. So the kwargs are tried in order, newest first, and the
-        # guard catches both exception types plus the RuntimeError some builds
-        # raise from their own argument checker.
-        #
-        # Newest first matters: on 2.x the 3.x kwargs are rejected immediately
-        # and cost nothing, whereas the reverse order would silently accept
-        # `use_gpu` on a 3.x build that has quietly started ignoring it.
+        # pins whichever one it pins this month. Try the compatible forms, but
+        # do not make the entire perception pass terminal when Paddle is absent.
         attempts = [
             ({"lang": None, "use_textline_orientation": True,
               "device": "gpu:0" if gpu else "cpu"}, "3.x"),
@@ -530,30 +524,41 @@ def ocr(job: Job) -> Emission:
         ]
 
         engines, why = {}, {}
-        for lang in langs:
-            for kwargs, label in attempts:
-                try:
-                    engines[lang] = PaddleOCR(**{**kwargs, "lang": lang})
-                    break
-                except (TypeError, ValueError, RuntimeError) as exc:
-                    why[lang] = f"{label}: {type(exc).__name__}: {exc}"
-                except ImportError:
-                    raise
-                except Exception as exc:      # noqa: BLE001
-                    # A download failure or a missing model file is not an
-                    # argument problem and retrying with fewer kwargs will not
-                    # help — stop on this language and keep the others.
-                    why[lang] = f"{label}: {type(exc).__name__}: {exc}"
-                    break
+        if PaddleOCR is not None:
+            for lang in langs:
+                for kwargs, label in attempts:
+                    try:
+                        engines[lang] = PaddleOCR(**{**kwargs, "lang": lang})
+                        break
+                    except (TypeError, ValueError, RuntimeError) as exc:
+                        why[lang] = f"{label}: {type(exc).__name__}: {exc}"
+                    except Exception as exc:      # noqa: BLE001
+                        why[lang] = f"{label}: {type(exc).__name__}: {exc}"
+                        break
         for lang in langs:
             if lang not in engines and lang in why:
                 job.note(f"PP-OCR could not initialise '{lang}' — {why[lang]}")
-        return engines
+
+        # EasyOCR is the reliable Kaggle fallback: its Reader exposes
+        # readtext(), whose [box, (text, confidence)] rows are normalized by
+        # _paddle_lines just like Paddle's legacy output.
+        if engines:
+            return engines
+        try:
+            import easyocr  # noqa: PLC0415
+            reader = easyocr.Reader(langs or ["en"],
+                                    gpu=("cuda:0" if gpu else False),
+                                    verbose=False)
+            job.note("PaddleOCR unavailable; using EasyOCR fallback")
+            return {"easyocr": reader}
+        except Exception as exc:                  # noqa: BLE001
+            job.note(f"EasyOCR fallback unavailable: {type(exc).__name__}: {exc}")
+            return {}
 
     try:
         engines = job.cache.get(job.component.load_key, loader)
     except ImportError:
-        raise SkipPass("paddleocr is not installed") from None
+        raise SkipPass("neither paddleocr nor easyocr is installed") from None
     if not engines:
         raise SkipPass("no OCR language could be initialised")
 
@@ -574,8 +579,13 @@ def ocr(job: Job) -> Emission:
             found: dict = {}
             for lang, engine in engines.items():
                 try:
-                    result = (engine.predict(img) if hasattr(engine, "predict")
-                              else engine.ocr(img, cls=True))
+                    if hasattr(engine, "predict"):
+                        result = engine.predict(img)
+                    elif hasattr(engine, "ocr"):
+                        result = engine.ocr(img, cls=True)
+                    else:
+                        # EasyOCR's output is already [box, (text, score)].
+                        result = engine.readtext(img, detail=1)
                 except Exception as exc:
                     failures += 1
                     if failures <= 3:
