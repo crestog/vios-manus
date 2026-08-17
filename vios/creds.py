@@ -92,7 +92,7 @@ ALIASES = {
 # the system reads straight from os.environ under exactly this name. Bridged
 # verbatim so storing one in Kaggle Secrets is enough — VIOS_NIM_API_KEY is
 # read by config.py and gates GraphRAG entity extraction.
-PASSTHROUGH = ("VIOS_NIM_API_KEY",)
+PASSTHROUGH = ("VIOS_NIM_API_KEY", "VIOS_ADMIN_TOKEN")
 
 # Names a credential must also appear under because third-party code reads
 # them and will never learn ours.

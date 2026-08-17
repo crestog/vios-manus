@@ -49,7 +49,9 @@ The startup cell remains:
 %run kaggle_boot.py
 ```
 
-The full two-GPU model scheduler is intentionally not enabled by these defaults. GPU model execution remains single-owner until a dedicated per-GPU worker contract is validated; the current change avoids trading download idle time for VRAM contention or SQLite corruption. Set `VIOS_PREFETCH_WORKERS=0` or `VIOS_ATLAS_LIVE_REFRESH=0` to disable the new background behaviors.
+On a machine with two visible GPUs, the processing plane now runs explicit lanes: physical GPU 0 owns capture restore, structure, perception, embeddings, and Telegram publication; physical GPU 1 owns Qwen language interpretation and writes evidence into the same WAL-backed store without publishing duplicate checkpoints. Set `VIOS_DUAL_GPU=0` only for a deliberate single-engine diagnostic run. If a GPU1 source handoff exceeds `VIOS_GPU_LANE_SOURCE_WAIT_SECONDS` (default 180), it falls back to standalone acquisition rather than silently losing work. Set `VIOS_PREFETCH_WORKERS=0` or `VIOS_ATLAS_LIVE_REFRESH=0` to disable the respective background behaviors.
+
+For a public cloudflared session, add a Kaggle Secret named `VIOS_ADMIN_TOKEN`. Mutating process, queue, capture, and admin routes require the `X-VIOS-Admin-Token` header. Do not set `VIOS_ALLOW_UNAUTH_ADMIN=1` on a public tunnel; it is only an explicit bypass for trusted local debugging.
 
 > Only `crestog/vios-manus` is an intended modification target. The original `crestog/VideoIntelligenceOS` remains read-only.
 

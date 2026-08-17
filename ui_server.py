@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
 import logging
+import hmac
 import aiofiles
 from fastapi.staticfiles import StaticFiles
 from pyrogram import Client
@@ -773,6 +774,34 @@ async def _lifespan(_app):
 # take /docs and give it the same footer every other page has. /openapi.json is
 # untouched — the page still reads its schema from there.
 app = FastAPI(title="Insta-Vault Modular OS", docs_url=None, lifespan=_lifespan)
+
+_ADMIN_MUTATING_PREFIXES = (
+    "/api/admin/", "/api/process/", "/api/queue/replay-dlq",
+    "/api/scan", "/api/capture/", "/api/cache/clear",
+)
+
+
+@app.middleware("http")
+async def _admin_token_guard(request: Request, call_next):
+    """Protect destructive control routes before they reach a handler."""
+    method = request.method.upper()
+    path = request.url.path
+    protected = method in {"POST", "PUT", "PATCH", "DELETE"} and any(
+        path.startswith(prefix) for prefix in _ADMIN_MUTATING_PREFIXES)
+    if protected:
+        expected = os.environ.get("VIOS_ADMIN_TOKEN", "").strip()
+        bypass = os.environ.get("VIOS_ALLOW_UNAUTH_ADMIN", "0").strip().lower()
+        if not expected and bypass not in {"1", "true", "yes", "on"}:
+            return JSONResponse(status_code=503, content={
+                "ok": False,
+                "error": "Admin token is not configured; set VIOS_ADMIN_TOKEN "
+                         "or explicitly enable VIOS_ALLOW_UNAUTH_ADMIN for a "
+                         "trusted local session."})
+        if expected and not hmac.compare_digest(
+                request.headers.get("x-vios-admin-token", ""), expected):
+            return JSONResponse(status_code=401, content={
+                "ok": False, "error": "Valid X-VIOS-Admin-Token required."})
+    return await call_next(request)
 
 
 # When the disk fills, SQLite raises "database or disk is full" from deep inside
