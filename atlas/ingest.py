@@ -119,6 +119,12 @@ def connect(path: str = None) -> sqlite3.Connection:
     """
     conn = sqlite3.connect(path or config.DB_PATH, timeout=60.0,
                            check_same_thread=False)
+    # Atlas readers use both positional and named-column access.  The server
+    # connection previously returned plain tuples, which made map refs/points
+    # fail with `tuple indices must be integers` while other routes appeared
+    # healthy. sqlite3.Row supports both access styles and keeps all readers
+    # consistent with the map builder connection.
+    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA cache_size=-64000")

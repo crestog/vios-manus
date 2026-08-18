@@ -844,6 +844,10 @@ body[data-player-size="theatre"]:has(.pane-player[data-open="true"]) .stage{
   height:100%; display:grid; place-content:center; justify-items:center;
   gap:18px; padding:40px; text-align:center; color:var(--dim); font-size:13.5px; line-height:1.6;
 }
+/* `.player-idle` has an explicit display value, so the native hidden attribute
+   does not remove it from layout. Without this companion rule, a deep-linked
+   video is hydrated correctly but pushed below the viewport by the idle rail. */
+.player-idle[hidden], .player-live[hidden]{ display:none; }
 .player-idle-mark{
   width:46px; height:46px; border-radius:50%;
   border:1px solid var(--line-2); position:relative;

@@ -33,6 +33,9 @@ def main():
         assert health['ready'] is True and health['mode'] == 'dashboard-only'
         videos = client.get('/api/videos').get_json()
         assert videos[0]['video_uuid'] == '8'
+        assert videos[0]['dashboard_only'] is True
+        assert videos[0]['stage'] == 'atlas-read-only'
+        assert videos[0]['evidence_count'] == videos[0]['moment_count']
         graph = client.get('/api/neo4j/graph').get_json()
         assert len(graph['nodes']) == 2 and len(graph['edges']) == 1
         assert client.get('/').status_code == 200

@@ -36,6 +36,7 @@ import shutil
 import sqlite3
 import threading
 import time
+import re
 
 # 20 MB — the Bot API's download ceiling. Reels are 2–8 MB, so this path
 # carries most of the archive; the ones it refuses are the three-minute ones.
@@ -43,6 +44,7 @@ BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024
 
 SHARD_PREFIX = "vios-evidence-"
 SHARD_SUFFIX = ".jsonl.gz"
+_SHARD_PART_RE = re.compile(r"^(?P<base>.+)\.part(?P<index>\d{3})of(?P<total>\d{3})$")
 
 # What counts as a video file when scanning a folder the operator pointed at.
 _VIDEO_EXT = (".mp4", ".mkv", ".webm", ".mov", ".m4v")
@@ -676,6 +678,26 @@ def shard_id_from_name(name: str) -> str:
     return name[len(SHARD_PREFIX):-len(SHARD_SUFFIX)]
 
 
+def shard_part_from_name(name: str) -> dict:
+    """Return logical shard and part coordinates from a Telegram filename.
+
+    Multipart evidence files keep the normal `.jsonl.gz` suffix so older
+    scanners still discover them. Their inner stem is
+    `sid.part001of003`; the logical id is `sid`, and a single-file shard is
+    represented as part 1 of 1.
+    """
+    raw = shard_id_from_name(name)
+    if not raw:
+        return {}
+    match = _SHARD_PART_RE.match(raw)
+    if not match:
+        return {"shard_id": raw, "index": 1, "total": 1}
+    index, total = int(match.group("index")), int(match.group("total"))
+    if index < 1 or total < index:
+        return {}
+    return {"shard_id": match.group("base"), "index": index, "total": total}
+
+
 def restore_shards(store, tg, channel: Channel, on_progress=None,
                    should_stop=None, batch: int = 200) -> dict:
     """Replay every evidence shard in the channel that this database lacks.
@@ -706,6 +728,10 @@ def restore_shards(store, tg, channel: Channel, on_progress=None,
     tmpdir = os.path.join(os.path.dirname(os.path.abspath(store.path)),
                           "_shards")
     os.makedirs(tmpdir, exist_ok=True)
+    # Collect first: multipart documents are not guaranteed to be adjacent in
+    # Telegram history, and importing the first part would make the logical
+    # shard look complete while its watermark is still missing data.
+    found = {}
 
     for lo in range(1, head + 1, batch):
         if should_stop and should_stop():
@@ -713,40 +739,80 @@ def restore_shards(store, tg, channel: Channel, on_progress=None,
         ids = list(range(lo, min(lo + batch, head + 1)))
         for msg in channel.messages(ids).values():
             doc = getattr(msg, "document", None)
-            sid = shard_id_from_name(getattr(doc, "file_name", "") if doc else "")
-            if not sid:
+            info = shard_part_from_name(
+                getattr(doc, "file_name", "") if doc else "")
+            if not info:
                 continue
             out["found"] += 1
-            if sid in have:
-                out["skipped"] += 1
+            sid = info["shard_id"]
+            group = found.setdefault(sid, {"total": info["total"],
+                                           "parts": {}})
+            if group["total"] != info["total"]:
+                out["errors"].append(
+                    f"{sid}: inconsistent part count "
+                    f"{group['total']} vs {info['total']}")
                 continue
-            path = os.path.join(tmpdir, shard_name(sid))
-            if not channel.download(msg, path):
-                out["errors"].append(f"{sid}: download failed")
-                continue
-            try:
-                counts = store.import_shard(path)
-                out["imported"] += 1
-                out["claims"] += counts.get("claim", 0)
-                out["vectors"] += counts.get("vector", 0)
-                store.note_shard(sid, "restored", int(msg.id),
-                                 {"claims": counts.get("claim", 0),
-                                  "vectors": counts.get("vector", 0),
-                                  "bytes": os.path.getsize(path)})
-                have.add(sid)
-            except Exception as exc:
-                out["errors"].append(f"{sid}: {type(exc).__name__}: "
-                                     f"{str(exc)[:120]}")
-            finally:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+            group["parts"].setdefault(info["index"], msg)
         if on_progress:
             try:
                 on_progress(min(lo + batch - 1, head), head, out["imported"])
             except Exception:
                 pass
+
+    for sid, group in found.items():
+        if should_stop and should_stop():
+            break
+        parts = group["parts"]
+        total = int(group["total"])
+        if sid in have:
+            out["skipped"] += len(parts)
+            continue
+        wanted = set(range(1, total + 1))
+        if set(parts) != wanted:
+            missing = ",".join(str(i) for i in sorted(wanted - set(parts)))
+            out["errors"].append(
+                f"{sid}: incomplete multipart shard ({len(parts)}/{total}); "
+                f"missing {missing}")
+            continue
+
+        downloaded = []
+        merged = os.path.join(tmpdir, shard_name(sid))
+        try:
+            for index in range(1, total + 1):
+                name = shard_name(f"{sid}.part{index:03d}of{total:03d}")
+                path = os.path.join(tmpdir, name)
+                if not channel.download(parts[index], path):
+                    raise RuntimeError(f"part {index}/{total} download failed")
+                downloaded.append({"part_index": index, "local_path": path})
+            if total == 1:
+                import_path = downloaded[0]["local_path"]
+            else:
+                _join(downloaded, merged)
+                import_path = merged
+            counts = store.import_shard(import_path)
+            out["imported"] += 1
+            out["claims"] += counts.get("claim", 0)
+            out["vectors"] += counts.get("vector", 0)
+            store.note_shard(sid, "restored", int(parts[1].id),
+                             {"claims": counts.get("claim", 0),
+                              "vectors": counts.get("vector", 0),
+                              "bytes": os.path.getsize(import_path),
+                              "parts": total})
+            have.add(sid)
+        except Exception as exc:
+            out["errors"].append(f"{sid}: {type(exc).__name__}: "
+                                 f"{str(exc)[:120]}")
+        finally:
+            for item in downloaded:
+                try:
+                    os.remove(item["local_path"])
+                except OSError:
+                    pass
+            if merged != (downloaded[0]["local_path"] if downloaded else ""):
+                try:
+                    os.remove(merged)
+                except OSError:
+                    pass
     return out
 
 

@@ -997,11 +997,36 @@ document.addEventListener('click', e => {
 
 /* ══ RUN ═══════════════════════════════════════════════════════════ */
 let selected = new Set(), catalog = [], catalogLoaded = false;
+let planSnapshot = null;
+
+function resourceLine(r){
+  r = r || {};
+  const g = Number(r.gpu_count || 0);
+  const v = Number(r.total_vram_mb || r.usable_vram_mb || 0);
+  if(g && v) return `${g}× GPU · ${(v / 1024).toFixed(1)} GB usable VRAM`;
+  if(g) return `${g}× GPU detected`;
+  return r.cpu_count ? `${r.cpu_count} CPU threads · CPU lane` : '';
+}
+
+function withPlanFallback(s){
+  if(!s || (s.cohorts && s.cohorts.length) || !planSnapshot?.cohorts?.length)
+    return s;
+  return {
+    ...s,
+    cohorts: planSnapshot.cohorts,
+    resources: (s.resources && Object.keys(s.resources).length)
+      ? s.resources : (planSnapshot.resources || {}),
+    resources_line: s.resources_line || planSnapshot.resources_line ||
+      resourceLine(planSnapshot.resources),
+  };
+}
+
 // The last status payload, kept so pages other than Run can answer questions
 // about the store without firing their own request.
 let last = null;
 
 function render(s){
+  s = withPlanFallback(s);
   last = s;
   const st = s.state || 'idle';
   const pill = $('#pill');
@@ -1665,6 +1690,13 @@ function drawChecks(res){
 async function loadPlan(){
   const r = await get('/api/process/plan');
   if(!r.ok) return;
+  planSnapshot = {...r, resources_line: resourceLine(r.resources)};
+  // Status and plan are separate routes. A status response can legitimately
+  // arrive from an idle/restarted engine before its in-memory cohorts are
+  // repopulated, even though the planner already succeeded. Re-render the live
+  // card now instead of leaving the operator with a false "No plan yet" state.
+  if(last && (!last.cohorts || !last.cohorts.length) && r.cohorts?.length)
+    render(last);
   const e = r.estimate || {};
   $('#ePasses').textContent = num(e.components);
   $('#eCohorts').textContent = num((r.cohorts || []).length);

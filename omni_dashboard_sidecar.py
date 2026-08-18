@@ -82,7 +82,10 @@ def _video_index(conn: sqlite3.Connection, limit: int = 1000) -> list[dict]:
         "creator": r["creator"] or "",
         "duration": r["duration"],
         "moment_count": int(r["moment_count"] or 0),
+        "evidence_count": int(r["moment_count"] or 0),
         "created_at": r["created_at"],
+        "stage": "atlas-read-only",
+        "dashboard_only": True,
     } for r in rows]
 
 

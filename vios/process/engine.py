@@ -91,6 +91,11 @@ PUBLISH_MAX_SECONDS = max(PUBLISH_MIN_SECONDS, float(os.environ.get("VIOS_PUBLIS
 # engine's uploader has no MTProto document path, so a bundle that would exceed
 # it is split rather than lost. 45 leaves room for the multipart envelope.
 STAGE_PART_BYTES = 45 * 1024 * 1024
+# Incremental evidence shards use gzip JSONL and must remain independently
+# reassemblable. Keep the uncompressed payload below the limit so every gzip
+# part is safely under Telegram's 50 MB document ceiling even for incompressible
+# vectors. A 40 MB cap also leaves envelope/retry headroom.
+SHARD_PART_BYTES = 40 * 1024 * 1024
 # Full SQLite stage snapshots are restore anchors, not the checkpoint stream.
 # Evidence shards are already uploaded incrementally after each pass; emitting a
 # whole database snapshot while a stage is still retrying caused Telegram to
@@ -1657,24 +1662,65 @@ class ProcessEngine:
                 frame_note = (f"\n{stats['frame_vectors']} frame-vector rows, "
                               f"{stats['frame_metrics']} frame-metric rows")
             msg_id = None
+            uploaded_parts = []
+            upload_paths = self._split_shard(path)
+            total_parts = len(upload_paths)
             if self._tg and self._tg.token:
-                caption = (f"vios evidence · {sid}\n"
-                           f"{stats['claims']} claims, {stats['vectors']} "
-                           f"vectors{frame_note}\nworker {self.index + 1}/"
-                           f"{self.partitions} · {note}")
-                try:
-                    res = self._tg.send_document(
-                        path, caption, file_name=intake.shard_name(sid))
-                    msg_id = res.get("message_id")
-                except UploadError as exc:
-                    self._log(f"Shard {sid} not uploaded: {exc}", "warn")
-                except Exception as exc:
-                    self._log(f"Shard {sid} not uploaded: "
-                              f"{type(exc).__name__}: {exc}", "warn")
+                for index, upload_path in enumerate(upload_paths, 1):
+                    if total_parts == 1:
+                        filename = intake.shard_name(sid)
+                        caption = (f"vios evidence · {sid}\n"
+                                   f"{stats['claims']} claims, {stats['vectors']} "
+                                   f"vectors{frame_note}\nworker {self.index + 1}/"
+                                   f"{self.partitions} · {note}")
+                    else:
+                        filename = intake.shard_name(
+                            f"{sid}.part{index:03d}of{total_parts:03d}")
+                        caption = (f"vios evidence · {sid} · part "
+                                   f"{index}/{total_parts}\n"
+                                   f"{stats['claims']} claims, {stats['vectors']} "
+                                   f"vectors{frame_note}\nworker {self.index + 1}/"
+                                   f"{self.partitions} · {note}\n"
+                                   "Restore joins all parts before import.")
+                    try:
+                        res = self._tg.send_document(
+                            upload_path, caption, file_name=filename)
+                        uploaded_parts.append(int(res.get("message_id") or 0))
+                    except UploadError as exc:
+                        self._log(f"Shard {sid} part {index}/{total_parts} "
+                                  f"not uploaded: {exc}", "warn")
+                        break
+                    except Exception as exc:
+                        self._log(f"Shard {sid} part {index}/{total_parts} "
+                                  f"not uploaded: {type(exc).__name__}: {exc}",
+                                  "warn")
+                        break
+                if len(uploaded_parts) == total_parts:
+                    msg_id = uploaded_parts[0] if uploaded_parts else None
+                    stats["parts"] = total_parts
+                    stats["message_ids"] = uploaded_parts
+
+            # Keep the original local shard when a Telegram upload fails; it is
+            # the durable retry input. Successful uploads can release the base
+            # file and generated parts. An offline run keeps the base file and
+            # removes only temporary split files.
+            has_telegram = bool(self._tg and self._tg.token)
+            if msg_id is not None:
+                for upload_path in set(upload_paths + [path]):
+                    try:
+                        os.remove(upload_path)
+                    except OSError:
+                        pass
+            elif not has_telegram:
+                for upload_path in upload_paths:
+                    if upload_path != path:
+                        try:
+                            os.remove(upload_path)
+                        except OSError:
+                            pass
 
             store.note_shard(sid, note, msg_id, stats)
             uploaded = msg_id is not None
-            has_telegram = bool(self._tg and self._tg.token)
             if uploaded or not has_telegram:
                 # The local shard file is durable enough for a deliberately
                 # offline run. When Telegram credentials exist, however, the
@@ -1713,6 +1759,51 @@ class ProcessEngine:
             if msg_id is None and self._tg and self._tg.token:
                 return ""
             return sid
+
+    def _split_shard(self, path: str) -> list:
+        """Split a large gzip JSONL shard only at complete-record boundaries.
+
+        Every output remains a valid evidence shard with the original header,
+        so a restore can concatenate the gzip streams in filename order and
+        replay one logical shard. The split is performed on uncompressed bytes
+        to guarantee the compressed documents stay below Telegram's hard cap.
+        """
+        import gzip          # noqa: PLC0415
+
+        if os.path.getsize(path) <= SHARD_PART_BYTES:
+            return [path]
+        parts = []
+        pending = None
+        with gzip.open(path, "rt", encoding="utf-8") as source:
+            header = source.readline()
+            if not header:
+                return [path]
+            while True:
+                index = len(parts) + 1
+                part = f"{path}.part{index:03d}"
+                used = len(header.encode("utf-8"))
+                wrote = False
+                with gzip.open(part, "wt", encoding="utf-8",
+                               compresslevel=6) as target:
+                    target.write(header)
+                    while True:
+                        line = pending if pending is not None else source.readline()
+                        pending = None
+                        if not line:
+                            break
+                        size = len(line.encode("utf-8"))
+                        if wrote and used + size > SHARD_PART_BYTES:
+                            pending = line
+                            break
+                        target.write(line)
+                        used += size
+                        wrote = True
+                parts.append(part)
+                if pending is None:
+                    break
+        # Do not remove the original until every Telegram part succeeds. It is
+        # the local retry/forensics copy if the session loses connectivity.
+        return parts
 
     def publish_now(self) -> dict:
         """The tab's manual button. Also the right thing to press before

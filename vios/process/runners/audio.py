@@ -234,6 +234,17 @@ def diarize(job: Job) -> Emission:
         pipe = job.cache.get(job.component.load_key, loader)
     except ImportError:
         raise SkipPass("pyannote.audio is not installed") from None
+    except Exception as exc:
+        detail = str(exc)
+        gated = ("GatedRepoError" in type(exc).__name__
+                 or "gated repo" in detail.lower()
+                 or "403 Client Error" in detail
+                 or "401 Client Error" in detail)
+        if gated:
+            raise SkipPass(
+                "pyannote weights are gated or the HF token lacks access; "
+                "accept the model terms and restart with VIOS_HF_TOKEN") from None
+        raise
 
     job.heartbeat("diarizing")
     annotation = pipe(wav_path)

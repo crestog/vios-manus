@@ -580,12 +580,22 @@
 
             box.innerHTML = shown.map(v => {
                 const u = esc(v.video_uuid);
-                const cov = v.chunks ? `${v.narrated}/${v.chunks}` : '0';
+                const atlasOnly = v.dashboard_only || v.stage === 'atlas-read-only';
+                const cov = atlasOnly
+                    ? `${Number(v.evidence_count ?? v.moment_count ?? 0).toLocaleString('en-US')}`
+                    : (v.chunks ? `${v.narrated ?? 0}/${v.chunks}` : '0');
+                const firstLabel = atlasOnly ? 'indexed evidence' : 'narrated';
+                const frameLabel = atlasOnly
+                    ? '<b>—</b> frames not reported'
+                    : `<b>${v.frames ?? 0}</b> frames`;
+                const title = atlasOnly
+                    ? 'Atlas evidence index · read-only dashboard'
+                    : (STAGE_TITLE[v.stage] || '');
                 return `<div class="vcard${u === currentVideoUuid ? ' sel' : ''}" data-uuid="${u}"`
-                     + ` title="${esc(STAGE_TITLE[v.stage] || '')}">`
-                     + `<span class="vid"><i class="vdot ${esc(v.stage)}"></i>${u}</span>`
-                     + `<div class="vstat"><span><b>${cov}</b> narrated</span>`
-                     + `<span><b>${v.frames}</b> frames</span>`
+                     + ` title="${esc(title)}">`
+                     + `<span class="vid"><i class="vdot ${esc(v.stage || 'frames-only')}"></i>${u}</span>`
+                     + `<div class="vstat"><span><b>${cov}</b> ${firstLabel}</span>`
+                     + `<span>${frameLabel}</span>`
                      + `<span>${esc(fmtDur(v.duration))}</span></div></div>`;
             }).join('');
         }
