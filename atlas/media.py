@@ -585,7 +585,24 @@ def poster(conn: sqlite3.Connection, video_key: str, at: float = None) -> str:
         return ""
     found = resolve(conn, key)
     if found["where"] not in ("local", "cache"):
-        return clip_poster(conn, key, 0.0 if at is None else float(at))
+        moment = 0.0 if at is None else float(at)
+        quick = clip_poster(conn, key, moment)
+        if quick:
+            return quick
+        # Older archives may contain the video message but no clip index. Give
+        # lazy library posters a bounded fallback: start the normal download,
+        # wait briefly, and extract once the file is resident. This is only
+        # reached for visible poster requests, never for background prefetch.
+        try:
+            fallback_wait = max(0.0, float(os.environ.get(
+                "ATLAS_POSTER_FALLBACK_WAIT", "8")))
+        except (TypeError, ValueError):
+            fallback_wait = 8.0
+        if fallback_wait:
+            ensure(conn, key, wait=fallback_wait)
+            found = resolve(conn, key)
+        if found["where"] not in ("local", "cache"):
+            return ""
 
     pos = 0.0 if at is None else max(0.0, float(at))
     stamp = f"{pos:.0f}"

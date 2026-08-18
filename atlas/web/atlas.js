@@ -579,10 +579,14 @@ function ribbon(video, { large = false, onSeek = null } = {}) {
 function posterImg(video, at, cls) {
   const key = video.video_key;
   const t = (at === null || at === undefined) ? '' : `?t=${Math.max(0, at).toFixed(1)}`;
-  const img = h('img', { alt: '', loading: 'lazy', 'data-src': U(`/api/poster/${key}${t}`) });
-  const wrap = h('div', { class: cls },
+  const img = h('img', { alt: `Video ${key}`, loading: 'lazy',
+    'data-src': U(`/api/poster/${encodeURIComponent(key)}${t}`) });
+  const wrap = h('div', { class: cls, 'data-video-key': key },
     h('span', { class: 'noshot', text: key }), img);
-  img.addEventListener('error', () => { img.remove(); });
+  img.addEventListener('error', () => {
+    wrap.classList.add('poster-missing');
+    img.remove();
+  });
   posterWatcher.observe(img);
   return wrap;
 }
@@ -999,15 +1003,20 @@ function pollMediaState(key) {
       // Streaming means bytes are already reaching the player. The video's own
       // events clear the overlay; showing a progress bar over a playing video
       // would be a lie about what it is waiting for.
-      if (st.status === 'error') {
+      if (st.status === 'error' || st.status === 'absent' ||
+          (st.where === 'missing' && st.status !== 'streaming')) {
         statePoll = 0;
-        busy(true, st.note || 'could not fetch this video from the channel', 0,
-          { action: { label: 'Try again', run: () => {
-              const vid = $('video');
-              busy(true, 'opening');
-              vid.load(); vid.play().catch(() => {});
-              pollMediaState(key);
-            } } });
+        const note = st.where === 'missing'
+          ? 'Atlas has no Telegram message id for this video.'
+          : (st.status === 'absent'
+            ? 'Media is not cached yet; start a bounded fetch from Telegram.'
+            : (st.note || 'could not fetch this video from the channel'));
+        busy(true, note, 0, { action: { label: 'Fetch and retry', run: () => {
+          const vid = $('video');
+          busy(true, 'requesting the media source');
+          vid.load(); vid.play().catch(() => {});
+          pollMediaState(key);
+        } } });
         return;
       }
       if (st.status !== 'streaming') {
@@ -3864,6 +3873,12 @@ async function mapsBoot(force) {
 async function mapsLoadProjection() {
   try {
     const meta = await api(`/api/map?level=${M.level}`);
+    if (meta.ok === false) {
+      mapsShowEmpty('Map is temporarily unavailable',
+        meta.note || 'Atlas is retrying the projection while the index settles.');
+      mapsRenderLegend();
+      return;
+    }
     M.clusters = meta.clusters || [];
     M.method = meta.method || '';
     if (!meta.count) {
@@ -3877,10 +3892,14 @@ async function mapsLoadProjection() {
 
     // The points come back as a packed buffer and the labels as JSON, in the
     // same row order. Fetched together because neither is useful alone.
-    const [buf, refs] = await Promise.all([
-      fetch(U(`/api/map/points?level=${M.level}`)).then(r => r.arrayBuffer()),
+    const [pointsResponse, refs] = await Promise.all([
+      fetch(U(`/api/map/points?level=${M.level}`)),
       api(`/api/map/refs?level=${M.level}`),
     ]);
+    if (!pointsResponse.ok) {
+      throw new Error('Atlas returned no map points; retry after indexing completes');
+    }
+    const buf = await pointsResponse.arrayBuffer();
     const view = new DataView(buf);
     const n = Math.floor(buf.byteLength / 12);
     M.xy = new Float32Array(n * 2);
@@ -5774,13 +5793,16 @@ function wire() {
   vid.addEventListener('playing', () => busy(false));
   vid.addEventListener('error', () => {
     if (!S.video) return;
-    // Almost always a 503 while the file is still arriving. One retry, then
-    // the poller keeps the person informed rather than showing a dead frame.
-    busy(true, 'waiting for the file');
+    // A remote 503 is not a decoding success. Stop the blind retry loop and
+    // let the media-state poller expose the actual source/fetch state.
     clearTimeout(retryTimer);
-    retryTimer = setTimeout(() => {
-      if (S.video) { vid.load(); vid.play().catch(() => {}); }
-    }, 3000);
+    busy(true, 'media source unavailable — checking Telegram state', 0,
+      { action: { label: 'Fetch and retry', run: () => {
+        busy(true, 'requesting the media source');
+        vid.load(); vid.play().catch(() => {});
+        pollMediaState(S.video.video_key);
+      } } });
+    pollMediaState(S.video.video_key);
   });
   vid.addEventListener('timeupdate', () => {
     const span = (S.video && S.video.duration) || vid.duration || 0;

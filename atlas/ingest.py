@@ -807,7 +807,13 @@ def _looks_like_asset_manifest(info: dict) -> bool:
     else produces it.
     """
     name = str(info.get("file_name") or "")
-    return name.endswith(_ASSET_SUFFIX) and len(name) > len(_ASSET_SUFFIX)
+    caption = str(info.get("caption") or "").strip().lower()
+    if name.endswith(_ASSET_SUFFIX) and len(name) > len(_ASSET_SUFFIX):
+        return True
+    # Telegram clients and Bot API responses do not always preserve a document
+    # filename. The capture plane deliberately repeats the identity in its
+    # caption, so use that marker to keep the fast clip-index path discoverable.
+    return caption.startswith("manifest · vios:") or caption.startswith("manifest - vios:")
 
 
 def _asset_manifest(conn: sqlite3.Connection, info: dict,

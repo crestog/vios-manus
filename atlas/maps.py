@@ -579,19 +579,39 @@ def built(conn: sqlite3.Connection) -> bool:
         return False
 
 
+def _terms_value(value) -> list:
+    """Decode cluster terms defensively; old/imported rows may be plain text."""
+    if value in (None, ""):
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    try:
+        decoded = json.loads(str(value))
+        if isinstance(decoded, list):
+            return [str(v) for v in decoded]
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return [str(value)[:160]]
+
+
 def meta(conn: sqlite3.Connection, level: str = "video") -> dict:
     """Everything needed to draw the legend and size the canvas."""
     ensure_schema(conn)
     level = "moment" if str(level) == "moment" else "video"
     from .ingest import meta_get
-    clusters = [
-        {"cluster": int(r["cluster"]), "label": r["label"],
-         "terms": json.loads(r["terms"] or "[]"), "size": int(r["size"] or 0),
-         "videos": int(r["videos"] or 0),
-         "cx": float(r["cx"] or 0), "cy": float(r["cy"] or 0)}
-        for r in conn.execute(
+    clusters = []
+    for r in conn.execute(
             "SELECT * FROM map_cluster WHERE level=? ORDER BY size DESC",
-            (level,)).fetchall()]
+            (level,)).fetchall():
+        try:
+            clusters.append({
+                "cluster": int(r["cluster"] or 0), "label": r["label"] or "",
+                "terms": _terms_value(r["terms"]),
+                "size": int(r["size"] or 0),
+                "videos": int(r["videos"] or 0),
+                "cx": float(r["cx"] or 0), "cy": float(r["cy"] or 0)})
+        except (TypeError, ValueError, KeyError):
+            continue
     n = conn.execute("SELECT COUNT(*) FROM map_point WHERE level=?",
                      (level,)).fetchone()[0]
     st = status()

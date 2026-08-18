@@ -91,6 +91,15 @@ PUBLISH_MAX_SECONDS = max(PUBLISH_MIN_SECONDS, float(os.environ.get("VIOS_PUBLIS
 # engine's uploader has no MTProto document path, so a bundle that would exceed
 # it is split rather than lost. 45 leaves room for the multipart envelope.
 STAGE_PART_BYTES = 45 * 1024 * 1024
+# Full SQLite stage snapshots are restore anchors, not the checkpoint stream.
+# Evidence shards are already uploaded incrementally after each pass; emitting a
+# whole database snapshot while a stage is still retrying caused Telegram to
+# receive language-0010, language-0011, language-0012, etc. Keep one final
+# snapshot per settled stage by default. Operators can explicitly restore the
+# old behavior for diagnostics.
+STAGE_SNAPSHOT_ONLY_FINAL = str(os.environ.get(
+    "VIOS_STAGE_SNAPSHOT_ONLY_FINAL", "1")).strip().lower() not in (
+        "0", "false", "no", "off")
 
 # Bundle file naming. Kept distinct from `intake.SHARD_PREFIX` on purpose: a
 # restore walking the channel must be able to tell a replayable delta from a
@@ -1888,6 +1897,14 @@ class ProcessEngine:
             return out
         if not report.get("counts", {}).get("total"):
             out["reason"] = "no rows in this stage"
+            return out
+        counts = report.get("counts", {})
+        settled = not (counts.get("queued", 0) or counts.get("running", 0))
+        if STAGE_SNAPSHOT_ONLY_FINAL and not settled:
+            out["reason"] = ("stage still has queued/running work; incremental "
+                             "evidence shards remain the durable checkpoint")
+            self._log(f"stage {stage}: snapshot deferred — {out['reason']}",
+                      "info")
             return out
 
         # The delta first, so the shard stream stays continuous and a reader

@@ -461,6 +461,13 @@
         function loadGraphHealth() {
             const el = document.getElementById('graph-banner');
             fetch('api/graph/health').then(r => r.json()).then(h => {
+                if (h.mode === 'dashboard-only') {
+                    el.className = 'banner warn';
+                    el.innerHTML = '<b>Read-only Atlas dashboard.</b> '
+                        + esc(h.note || (h.omni && h.omni.message) || '')
+                        + ' Heavy Omni model workers are intentionally disabled.';
+                    return;
+                }
                 if (h.ready === false) {
                     el.className = 'banner warn';
                     el.innerHTML = '<b>Omni dashboard is online but still starting.</b> '
@@ -495,6 +502,14 @@
             scope.innerText = 'loading corpus graph…';
             loadGraphHealth();
             fetch('api/neo4j/graph?limit=400').then(r => r.json()).then(data => {
+                if (data.mode === 'atlas-read-only') {
+                    scope.innerText = data.nodes && data.nodes.length
+                        ? `${data.nodes.length} Atlas nodes · ${(data.edges || []).length} edges · read-only`
+                        : (data.empty_reason || 'Atlas graph is empty in read-only mode.');
+                    renderLegend('global-legend', data.counts || null);
+                    globalNet = renderGraph('global-canvas', 'global-inspector', data);
+                    return;
+                }
                 if (data.ready === false) {
                     scope.innerText = 'Omni is starting — retrying graph load…';
                     setTimeout(loadGlobalGraph, 3000);
@@ -590,6 +605,11 @@
 
         function loadVideoIndex() {
             fetch('api/videos').then(r => r.json()).then(data => {
+                if (data && data.mode === 'dashboard-only') {
+                    document.getElementById('vlist-content').innerHTML =
+                        '<p style="color:#d29922;">Atlas-backed read-only dashboard; heavy Omni workers are disabled.</p>';
+                    return;
+                }
                 if (data.ready === false) {
                     document.getElementById('vlist-content').innerHTML =
                         '<p style="color:#d29922;">Omni is starting — retrying…</p>';

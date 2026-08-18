@@ -216,8 +216,16 @@ def diarize(job: Job) -> Emission:
     def loader():
         import torch  # noqa: PLC0415
         from pyannote.audio import Pipeline  # noqa: PLC0415
-        pipe = Pipeline.from_pretrained(job.component.model,
-                                        use_auth_token=token)
+        try:
+            # Recent pyannote.audio releases renamed the Hugging Face argument
+            # from use_auth_token to token. Keep the fallback for Kaggle images
+            # that still ship an older pyannote release.
+            pipe = Pipeline.from_pretrained(job.component.model, token=token)
+        except TypeError as exc:
+            if "token" not in str(exc) and "use_auth_token" not in str(exc):
+                raise
+            pipe = Pipeline.from_pretrained(job.component.model,
+                                            use_auth_token=token)
         if job.resources.get("gpu_count"):
             pipe.to(torch.device("cuda"))
         return pipe

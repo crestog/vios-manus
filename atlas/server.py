@@ -459,12 +459,52 @@ def sitemap_js_standalone():
 
 
 # ── state ─────────────────────────────────────────────────────────────────
+def _reconcile_boot(conn: sqlite3.Connection, boot: dict,
+                    ingest_state: dict, index_state: dict,
+                    graph_state: dict, map_state: dict) -> dict:
+    """Repair a stale progress label after the actual derived stores finished.
+
+    Older Atlas sessions could complete graph/map/index work and then leave the
+    in-memory boot flag at `indexing`. The API and frontend would consequently
+    keep saying "deriving the relationship graph" forever even though search and
+    map data were available. Readiness is derived from the stores here, without
+    hiding an active ingest/index/map operation.
+    """
+    if str(boot.get("phase") or "") in ("ready", "error"):
+        return boot
+    if ingest_state.get("running") or map_state.get("running"):
+        return boot
+    phase = str(index_state.get("phase") or "").lower()
+    if phase in ("scanning", "embedding", "indexing", "rebuilding"):
+        return boot
+    if not graph_state.get("nodes"):
+        return boot
+    try:
+        moments = int(conn.execute("SELECT COUNT(*) FROM moments").fetchone()[0])
+        videos = int(conn.execute("SELECT COUNT(*) FROM video_index").fetchone()[0])
+    except (sqlite3.Error, TypeError, ValueError):
+        return boot
+    if not moments:
+        return boot
+    _boot_set(phase="ready", detail=f"{moments} passage(s) across {videos} video(s)",
+              ready_at=boot.get("ready_at") or time.time(), error="")
+    with _BOOT_LOCK:
+        boot = dict(_BOOT)
+    return boot
+
+
 @app.get("/api/status")
 def api_status():
     """One call the interface polls for everything that changes."""
     conn = db()
+    ingest_state = ingest.status()
+    index_state = index.status()
+    graph_state = graph.counts(conn)
+    map_state = maps.status()
     with _BOOT_LOCK:
         boot = dict(_BOOT)
+    boot = _reconcile_boot(conn, boot, ingest_state, index_state,
+                           graph_state, map_state)
     boot["elapsed"] = round(time.time() - boot["started_at"], 1)
 
     try:
@@ -475,11 +515,11 @@ def api_status():
 
     return {
         "boot": boot,
-        "ingest": ingest.status(),
-        "index": index.status(),
+        "ingest": ingest_state,
+        "index": index_state,
         "search": search.stats(conn),
-        "graph": graph.counts(conn),
-        "map": maps.status(),
+        "graph": graph_state,
+        "map": map_state,
         "bundles": bundles,
         "cache": media.cache_stats(),
         "telegram": {"configured": config.telegram_ready(),
@@ -1343,34 +1383,41 @@ def api_clips(video_key: str, t0: float = None, t1: float = None):
 @app.get("/api/map")
 def api_map(level: str = "video"):
     """Legend, cluster names, method and readiness — everything but the points."""
-    conn = db()
-    out = maps.meta(conn, level)
-    if not out["count"]:
-        # A missing map is a normal state on a fresh archive, not an error: the
-        # encoder may still be running. Say which, so the interface can show a
-        # progress line instead of an empty canvas with no explanation.
-        st = index.status()
-        out["note"] = ("the dense index is still building — the map appears "
-                       "when it finishes" if st.get("phase") == "embedding"
-                       else maps.status().get("detail", ""))
-    return out
+    try:
+        conn = db()
+        out = maps.meta(conn, level)
+        if not out["count"]:
+            # A missing map is a normal state on a fresh archive, not an error:
+            # the encoder may still be running.
+            st = index.status()
+            out["note"] = ("the dense index is still building — the map appears "
+                           "when it finishes" if st.get("phase") == "embedding"
+                           else maps.status().get("detail", ""))
+        return out
+    except Exception as exc:  # noqa: BLE001
+        log(f"map metadata unavailable — {type(exc).__name__}: {exc}", "WARN")
+        return {"ok": False, "level": ("moment" if level == "moment" else "video"),
+                "count": 0, "clusters": [], "method": "", "built_at": 0,
+                "status": maps.status(),
+                "note": "map projection is temporarily unavailable; retrying",
+                "error": f"{type(exc).__name__}: {str(exc)[:180]}"}
 
 
 @app.get("/api/map/points")
 def api_map_points(level: str = "video"):
-    """The point cloud as a packed binary buffer.
-
-    Binary rather than JSON because this is the one response whose size scales
-    with the whole archive. Twelve bytes a point against roughly forty, and the
-    browser gets a typed array it can hand straight to the canvas instead of a
-    parse pass over a megabyte of text.
-    """
-    conn = db()
-    buf = maps.points_binary(conn, level)
-    return Response(buf, media_type="application/octet-stream", headers={
-        "X-Map-Count": str(len(buf) // 12),
-        "X-Map-Stride": "12",
-        "Cache-Control": "no-cache"})
+    """The point cloud as a packed binary buffer."""
+    try:
+        conn = db()
+        buf = maps.points_binary(conn, level)
+        return Response(buf, media_type="application/octet-stream", headers={
+            "X-Map-Count": str(len(buf) // 12),
+            "X-Map-Stride": "12",
+            "Cache-Control": "no-cache"})
+    except Exception as exc:  # noqa: BLE001
+        log(f"map points unavailable — {type(exc).__name__}: {exc}", "WARN")
+        return Response(b"", media_type="application/octet-stream", headers={
+            "X-Map-Count": "0", "X-Map-Stride": "12", "X-Map-State": "degraded",
+            "Cache-Control": "no-cache"})
 
 
 @app.get("/api/map/refs")
