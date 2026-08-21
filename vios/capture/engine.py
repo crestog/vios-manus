@@ -33,6 +33,7 @@ never read from a module constant.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import threading
@@ -44,7 +45,7 @@ import traceback
 # `vios.capture.fetch` from the submodule to the function. A relative module
 # import would then silently pick up the function and fail on the first
 # `fetchmod.cleanup(...)` — an hour into a run, not at import time.
-from .fetch import (fetch as fetch_one, cleanup as fetch_cleanup,
+from .fetch import (fetch as fetch_one, fetch_local, cleanup as fetch_cleanup,
                     FetchError, tool_versions)
 from .assets import publish_assets
 from .ledger import Ledger, open_ledger
@@ -119,6 +120,8 @@ class CaptureEngine:
         self.cred_sources: dict = {}
 
         self.pacer = Pacer()
+        self.local_target = max(2.0, float(
+            os.environ.get("VIOS_LOCAL_TARGET_SECONDS", "8")))
         self.skip_collections: tuple = ()
         self.max_attempts = 5
         self.allow_gallery_dl = True
@@ -172,8 +175,9 @@ class CaptureEngine:
     # ── configuration ────────────────────────────────────────────────────
     def configure(self, bot_token: str = "", channel_id=None, api_id=0,
                   api_hash: str = "", cookies_text: str = "",
-                  target: float | None = None, quiet_hours: bool | None = None,
-                  breaks: bool | None = None, skip_collections=None,
+                  target: float | None = None, local_target: float | None = None,
+                  quiet_hours: bool | None = None, breaks: bool | None = None,
+                  skip_collections=None,
                   max_attempts: int | None = None,
                   allow_gallery_dl: bool | None = None,
                   speed: str | None = None) -> dict:
@@ -202,6 +206,8 @@ class CaptureEngine:
                 self.pacer.set_profile(speed)
             if target:
                 self.pacer.target = max(self.pacer.floor, float(target))
+            if local_target:
+                self.local_target = max(2.0, float(local_target))
             if quiet_hours is not None:
                 self.pacer.quiet_hours = bool(quiet_hours)
             if breaks is not None:
@@ -267,6 +273,7 @@ class CaptureEngine:
                                 and os.path.isfile(self._cookies_path)),
             "speed": self.pacer.profile,
             "target_seconds": round(self.pacer.target, 1),
+            "local_target_seconds": round(self.local_target, 1),
             "quiet_hours": self.pacer.quiet_hours,
             "breaks": self.pacer.breaks,
             "skip_collections": list(self.skip_collections),
@@ -292,10 +299,19 @@ class CaptureEngine:
                 out["blocking"].append(name)
 
         tools = tool_versions()
-        check("yt-dlp", bool(tools["yt_dlp"]),
-              tools["yt_dlp"] or "not installed — pip install -U yt-dlp")
+        counts = self.ledger.counts()
+        local_pending = self.ledger.conn.execute(
+            "SELECT COUNT(*) AS n FROM item WHERE state IN ('queued','failed') "
+            "AND kind='local-media' AND next_try_at<=?", (time.time(),)
+        ).fetchone()["n"]
+        remote_pending = max(0, int(counts.get("remaining", 0)) - int(local_pending))
+        check("yt-dlp", bool(tools["yt_dlp"]) or remote_pending == 0,
+              tools["yt_dlp"] or ("not needed — the current queue contains only "
+                                  "authorized local media" if remote_pending == 0
+                                  else "not installed — pip install -U yt-dlp"),
+              blocking=remote_pending > 0)
         check("gallery-dl", bool(tools["gallery_dl"]),
-              tools["gallery_dl"] or "not installed (optional fallback)",
+              tools["gallery_dl"] or "not installed (optional legacy fallback)",
               blocking=False)
         check("ffmpeg", bool(tools["ffmpeg"]),
               tools["ffmpeg"] or "not on PATH (optional)", blocking=False)
@@ -317,13 +333,14 @@ class CaptureEngine:
         free = shutil.disk_usage(self.base).free
         check("Disk", free > MIN_FREE_BYTES, f"{free / 1024**3:.1f} GB free")
 
-        counts = self.ledger.counts()
         check("Queue", counts.get("remaining", 0) > 0,
               f"{counts.get('remaining', 0)} to capture, "
               f"{counts.get('uploaded', 0)} already done")
 
         out["ok"] = not out["blocking"]
         out["counts"] = counts
+        out["sources"] = {"local_pending": int(local_pending),
+                           "remote_pending": int(remote_pending)}
         out["eta_hours"] = round(
             self.pacer.eta_seconds(counts.get("remaining", 0)) / 3600, 1)
         return out
@@ -447,7 +464,7 @@ class CaptureEngine:
                     self._snapshot(led, force=True)
                     return
 
-                self._wait(ok)
+                self._wait(ok, local=bool(item.get("kind") == "local-media"))
 
             if self._should_stop():
                 self.message = (f"Stopped. {self.session_done} captured this "
@@ -507,11 +524,22 @@ class CaptureEngine:
                     f"only {free / 1024**3:.1f} GB free — pausing to avoid "
                     f"a half-written upload")
 
-            result = fetch_one(
-                url, key, work, cookies=self._cookies_path or None,
-                collections=self._collections(led, key),
-                allow_gallery_dl=self.allow_gallery_dl,
-                fast=(self.pacer.profile == "fast"))
+            collections = self._collections(led, key)
+            try:
+                capture_meta = json.loads(item.get("capture_meta") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                capture_meta = {}
+            if item.get("kind") == "local-media" or url.startswith("file://"):
+                local_path = capture_meta.get("path") or url[7:]
+                result = fetch_local(local_path, key, work,
+                                     metadata=capture_meta,
+                                     collections=collections)
+            else:
+                result = fetch_one(
+                    url, key, work, cookies=self._cookies_path or None,
+                    collections=collections,
+                    allow_gallery_dl=self.allow_gallery_dl,
+                    fast=(self.pacer.profile == "fast"))
 
             self.current["phase"] = "uploading"
             self.current["bytes"] = result["bytes"]
@@ -672,13 +700,23 @@ class CaptureEngine:
             self.current["sent"] = sent
             self.current["total"] = total
 
-    def _wait(self, ok: bool):
-        """The deliberate idle between reels — the whole anti-detection budget.
+    def _wait(self, ok: bool, local: bool = False):
+        """Wait between queue items using source-appropriate durability policy.
 
-        A failure does not shorten this. Retrying quickly after a refusal is
-        the single behaviour most likely to escalate a soft rate limit into a
-        hard block, so a failed fetch waits exactly as long as a good one.
+        Instagram work uses the established conservative pacer. Authorized local
+        media never contacts Instagram, so it uses a separate Telegram upload
+        interval rather than making a local archive unnecessarily take a week.
         """
+        if local:
+            gap = self.local_target
+            self.waiting_until = time.time() + gap
+            self.pacer.sleep(gap, should_stop=self._should_stop)
+            self.waiting_until = None
+            return
+
+        # The deliberate idle between Instagram reels — the whole conservative
+        # source-access budget. A failure does not shorten this; retrying quickly
+        # after a refusal is the behaviour most likely to escalate a soft limit.
         if self.pacer.due_for_break():
             span = self.pacer.take_break()
             self.message = (f"Taking a {span / 60:.0f} minute break — "
@@ -841,11 +879,23 @@ class CaptureEngine:
         """Parse an export ZIP or markdown file and enqueue everything in it."""
         from .inputs import parse_any
         parsed = parse_any(path, data)
-        res = self.ledger.add_many(parsed["items"],
-                                   source=os.path.basename(path))
+        source = os.path.basename(path)
+        if parsed.get("external"):
+            external = [dict(entry) for entry in parsed["external"]]
+            manifest_dir = (os.path.dirname(os.path.abspath(path))
+                            if data is None else "")
+            if manifest_dir:
+                for entry in external:
+                    candidate = str(entry.get("path") or "")
+                    if candidate and not os.path.isabs(candidate):
+                        entry["path"] = os.path.join(manifest_dir, candidate)
+            res = self.ledger.add_external_many(external, source=source)
+        else:
+            res = self.ledger.add_many(parsed["items"], source=source)
         res.update({"format": parsed["format"],
                     "collections": parsed["collections"],
-                    "found": len(parsed["items"])})
+                    "found": len(parsed.get("items") or []) +
+                             len(parsed.get("external") or [])})
         return res
 
     def import_text(self, text: str, source: str = "pasted") -> dict:

@@ -332,9 +332,10 @@ details.step .in{padding:15px 16px 18px}
     <!-- ══ RUN ═══════════════════════════════════════════════════════ -->
     <section class="page" id="p-run">
       <h2 class="title">Run</h2>
-      <p class="lede">One reel every couple of minutes, for as long as it takes.
-        Stop it whenever you like — nothing is lost, and nothing already in the
-        channel is ever downloaded twice.</p>
+      <p class="lede">Capture is source-agnostic and resumable. The safest bulk path is an
+        authorized local-media manifest or creator-provided export; VIOS archives
+        those bytes without logging into Instagram. Legacy Instagram URL capture
+        remains available only for content you are authorized to access.</p>
 
       <div class="sec">
         <h3>Ledger</h3>
@@ -346,9 +347,10 @@ details.step .in{padding:15px 16px 18px}
         <div class="card">
           <div class="band" style="background:linear-gradient(90deg,var(--visual),var(--speech))"></div>
           <h4>Before the first run</h4>
-          <p class="hint">Checks everything that could stop a week-long job:
-            the downloader, the bot's permission to post, your cookies, free disk
-            and whether there is anything queued.</p>
+          <p class="hint">Checks everything that could stop a long-running job:
+            the selected source path, the bot's permission to post, free disk,
+            and whether there is anything queued. Cookie-based Instagram access
+            is optional and is never required for authorized local manifests.</p>
           <div class="btns">
             <button class="btn" id="bCheck">Run pre-flight check</button>
             <button class="btn ghost" id="bScan">Scan channel for existing reels</button>
@@ -433,15 +435,15 @@ details.step .in{padding:15px 16px 18px}
       </div>
 
       <div class="sec">
-        <h3>Instagram — proving you are logged in</h3>
+        <h3>Legacy Instagram connector — optional and not for bulk scraping</h3>
         <div class="card">
           <div class="band" style="background:var(--caption)"></div>
           <h4>Cookies</h4>
-          <p class="hint">Saved and private reels are only visible to a logged-in
-            account, so the downloader needs your session cookie. Use a
-            <strong>second, throwaway Instagram account</strong> — if anything
-            ever goes wrong it is that account that pays for it, not your main
-            one. Export in Netscape format and paste the whole file below.</p>
+          <p class="hint"><strong>Prefer the official Instagram APIs, creator exports,
+            or local manifests.</strong> This legacy connector uses a browser session
+            and may be blocked by Instagram. Do not rotate throwaway accounts,
+            proxies, or fingerprints to evade enforcement. Only use a session for
+            content you own or are explicitly authorized to process.</p>
           <div class="field">
             <label>cookies.txt <span class="note">— stored in memory and in a
               0600 scratch file, deleted when the engine stops</span></label>
@@ -453,22 +455,32 @@ details.step .in{padding:15px 16px 18px}
       </div>
 
       <div class="sec">
-        <h3>Pace — how invisible you want to be</h3>
+        <h3>Queue policy — durable, conservative, and resumable</h3>
         <div class="card">
           <div class="band" style="background:var(--visual)"></div>
           <div class="field">
             <label>Profile <span class="note">— what you are willing to spend</span></label>
             <select id="speed">
-              <option value="safe" selected>Careful — protect the account, about a week for 5,000</option>
-              <option value="fast">Fast — burn the account, a few hours for 5,000</option>
+              <option value="safe" selected>Conservative — protect source access and preserve resumability</option>
             </select>
           </div>
           <p class="lede" id="speedNote" style="margin:-2px 0 12px">
-            Careful keeps the request rate sixty times under the level where Instagram starts
-            refusing, and shapes the gaps so there is no rhythm to detect.</p>
+            Conservative mode limits concurrency, applies backoff after failures, and
+            preserves every queued item. It is not an anti-detection guarantee; it is
+            a reliability policy. The preferred bulk route makes no Instagram request
+            at all because the media is already local.</p>
           <div class="row">
             <div class="field">
-              <label>Seconds between reels <span class="note">— average, not fixed</span></label>
+              <label>Seconds between local uploads <span class="note">— authorized manifests</span></label>
+              <select id="localTarget">
+                <option value="2">2s — fastest conservative Telegram archive</option>
+                <option value="8" selected>8s — recommended</option>
+                <option value="15">15s — low-pressure channel pace</option>
+                <option value="30">30s — quietest</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Seconds between Instagram reels <span class="note">— legacy connector</span></label>
               <select id="target">
                 <option value="60">60s — about 1,400/day (faster, more visible)</option>
                 <option value="120" selected>120s — about 700/day (recommended)</option>
@@ -490,11 +502,11 @@ details.step .in{padding:15px 16px 18px}
             </select>
           </div>
           <label class="check"><input type="checkbox" id="breaks" checked>
-            Take a 12–40 minute break every 18–40 reels</label>
+            Take scheduled pauses between source batches</label>
           <label class="check"><input type="checkbox" id="quiet" checked>
-            Slow down between 02:00 and 06:00, like a person asleep</label>
+            Pause overnight when operating the legacy Instagram connector</label>
           <label class="check"><input type="checkbox" id="galleryDl" checked>
-            Fall back to gallery-dl when yt-dlp cannot get a reel</label>
+            Allow the legacy gallery-dl fallback for authorized Instagram URLs</label>
           <div class="field">
             <label>Skip these collections <span class="note">— comma separated, optional</span></label>
             <input type="text" id="skipCols" placeholder="memes, random">
@@ -509,12 +521,13 @@ details.step .in{padding:15px 16px 18px}
         <div class="card">
           <div class="band" style="background:var(--concept)"></div>
           <h4>Your saved reels</h4>
-          <p class="hint">Drop in the Instagram data export (<code>.zip</code>) or
-            a markdown file of links. Importing the same file twice is safe —
-            anything already known is counted as a duplicate and left alone.</p>
+          <p class="hint">Use a creator-provided export, a markdown link list, or an
+            <strong>authorized local-media manifest</strong> prepared on Kaggle. Importing
+            the same file twice is safe — content-addressed media is counted as a
+            duplicate and left alone.</p>
           <div class="field">
-            <label>Export ZIP or markdown file</label>
-            <input type="file" id="file" accept=".zip,.md,.txt,.json"
+            <label>Export, link list, or authorized media manifest</label>
+            <input type="file" id="file" accept=".zip,.md,.txt,.json,.jsonl,.ndjson"
                    style="font-family:var(--body);padding:8px">
           </div>
           <div class="field">
@@ -529,6 +542,11 @@ details.step .in{padding:15px 16px 18px}
               headings are read as collections</span></label>
             <textarea id="paste" placeholder="## Business&#10;https://www.instagram.com/reel/…&#10;https://www.instagram.com/reel/…" spellcheck="false"></textarea>
           </div>
+          <div class="callout" style="margin-top:12px"><b>Local manifest format</b>
+            one JSON object per line, for example
+            <code>{"path":"/kaggle/input/reels/a.mp4","creator":"owner","license":"permission"}</code>.
+            VIOS copies only local files; remote URLs remain provenance references and
+            are never fetched by this safe path.</div>
           <div class="btns"><button class="btn primary" id="bImport">Import</button></div>
           <div class="result" id="rImport"></div>
         </div>
@@ -718,21 +736,19 @@ details.step .in{padding:15px 16px 18px}
           </div>
         </details>
 
-        <details class="step">
-          <summary><span class="stepnum">03</span> Make a throwaway Instagram account</summary>
+                  <details class="step">
+          <summary><span class="stepnum">03</span> Choose an authorized source</summary>
+
           <div class="in help-body">
-            <p>The downloader signs in as you to see your saved reels. Use a
-              <strong>second account</strong> for this, never your real one.</p>
+            <p>For thousands of items, do not build the system around a disposable
+              Instagram account. Prefer one of these durable paths:</p>
             <ol>
-              <li>Create a new Instagram account. Give it a profile picture and
-                follow twenty or thirty accounts — a completely empty account that
-                immediately starts fetching reels looks exactly like what it is.</li>
-              <li>Let it sit for a day or two before using it here.</li>
-              <li>If your saved reels are on your main account, you have two
-                choices: export the links from the main account (step&nbsp;4) and
-                let the throwaway do the downloading, which works for any public
-                reel; or accept the risk and use the main account's cookies for
-                private ones.</li>
+              <li>Use the official Instagram APIs for professional accounts and media
+                you own or are authorized to access.</li>
+              <li>Request a creator-provided export or receive the original files in a
+                Kaggle dataset, then import a local JSONL manifest.</li>
+              <li>Use the legacy URL connector only for small, authorized batches and
+                stop when the platform reports a checkpoint or access restriction.</li>
             </ol>
           </div>
         </details>
@@ -766,20 +782,15 @@ details.step .in{padding:15px 16px 18px}
           </div>
         </details>
 
-        <details class="step">
-          <summary><span class="stepnum">05</span> Export your cookies</summary>
+                  <details class="step">
+          <summary><span class="stepnum">05</span> Configure the legacy connector only if necessary</summary>
+
           <div class="in help-body">
-            <ol>
-              <li>Log into Instagram in a browser, using the throwaway account.</li>
-              <li>Install a cookie exporter extension — <em>Get cookies.txt
-                LOCALLY</em> for Chrome, or <em>cookies.txt</em> for Firefox. Pick
-                one that works offline; an extension that uploads your cookies to
-                a server is handing over the account.</li>
-              <li>With instagram.com open, click the extension and export in
-                <strong>Netscape</strong> format.</li>
-              <li>Open the downloaded file in a text editor, copy everything, and
-                paste it into the Cookies box on the Setup tab.</li>
-            </ol>
+            <p>Cookies are session credentials, not a scaling strategy. If you use
+              this legacy path, use only an authorized account, keep the batch small,
+              and never share or rotate credentials to evade a restriction. A blocked
+              or checkpointed session should be treated as a source outage; resume
+              later from the ledger or switch to a local/creator-provided source.</p>
             <div class="callout warn"><b>Cookies expire.</b> Instagram sessions last
               weeks, not months. If the run starts failing with login errors,
               export them again — the ledger keeps everything it already captured,
@@ -1086,6 +1097,8 @@ function fillPace(cfg){
   if(paceFilled || !cfg) return;
   paceFilled = true;
   if(cfg.speed) $('#speed').value = cfg.speed;
+  const lt = String(Math.round(cfg.local_target_seconds || 8));
+  if([...$('#localTarget').options].some(o => o.value === lt)) $('#localTarget').value = lt;
   const t = String(Math.round(cfg.target_seconds || 0));
   const box = cfg.speed === 'fast' ? $('#targetFast') : $('#target');
   if([...box.options].some(o => o.value === t)) box.value = t;
@@ -1099,10 +1112,9 @@ function fillPace(cfg){
   paceMode();
 }
 
-// Which controls are meaningful depends on the profile: breaks and quiet
-// hours are camouflage, and camouflage on a run that is deliberately loud is
-// just a slower run. The engine turns them off on switch; this keeps the form
-// honest about it rather than showing ticked boxes that no longer apply.
+// Keep the controls honest about the selected source policy. Conservative
+// mode is the only bulk profile exposed here; it preserves resumability and
+// applies backoff, but it is not an anti-detection guarantee.
 function paceMode(){
   const fast = $('#speed').value === 'fast';
   $('#fastRow').style.display = fast ? '' : 'none';
@@ -1111,13 +1123,10 @@ function paceMode(){
   $('#target').closest('.field').style.display = fast ? 'none' : '';
   $('#breaks').closest('.check').style.display = fast ? 'none' : '';
   $('#quiet').closest('.check').style.display = fast ? 'none' : '';
-  $('#speedNote').textContent = fast
-    ? 'Fast drops the gap to a few seconds, turns off breaks and quiet hours, and '
-      + 'splits each download across four connections. Expect Instagram to start '
-      + 'refusing — everything already captured is safe in the channel, so the cost '
-      + 'is the login, never the data.'
-    : 'Careful keeps the request rate sixty times under the level where Instagram '
-      + 'starts refusing, and shapes the gaps so there is no rhythm to detect.';
+  $('#speedNote').textContent = 'Conservative mode limits concurrency, applies '
+    + 'backoff after failures, and preserves every queued item. It is not an '
+    + 'anti-detection guarantee; the preferred bulk route makes no Instagram '
+    + 'request because the media is already local.';
 }
 $('#speed').onchange = paceMode;
 paceMode();
@@ -1127,6 +1136,7 @@ $('#bSavePace').onclick = async () => {
   const j = await post('/api/capture/config', form({
     speed: $('#speed').value,
     target_seconds: fast ? $('#targetFast').value : $('#target').value,
+    local_target_seconds: $('#localTarget').value,
     max_attempts: $('#maxAttempts').value,
     breaks: fast ? '0' : ($('#breaks').checked ? '1' : '0'),
     quiet_hours: fast ? '0' : ($('#quiet').checked ? '1' : '0'),
@@ -1137,8 +1147,9 @@ $('#bSavePace').onclick = async () => {
     const s = j.settings, t = s.target_seconds;
     const rate = t < 60 ? `about ${Math.round(3600 / t)} an hour`
                         : `about ${Math.round(86400 / t)} a day`;
-    say('#rPace', `${s.speed === 'fast' ? 'Fast' : 'Careful'} — one reel every `
-      + `${t}s on average, ${rate}.`, 'ok');
+    say('#rPace', `Conservative — Instagram items every ${t}s on average (${rate}); `
+      + `local manifests every ${s.local_target_seconds || $('#localTarget').value}s. `
+      + `Local manifests never contact Instagram.`, 'ok');
   } else say('#rPace', j.error, 'no');
 };
 
@@ -1193,11 +1204,14 @@ $('#bImport').onclick = async () => {
     // "already known" counts reels this ledger had before the import, never a
     // reel's second collection tag — that distinction is the whole point.
     const bits = [`${num(r.added)} new to the queue`];
+    if(r.format === 'authorized-local-manifest')
+      bits.push('local bytes will be archived without an Instagram request');
     if(r.duplicate) bits.push(`${num(r.duplicate)} already in the ledger`
       + (r.captured ? ` (${num(r.captured)} captured)` : ''));
     if(r.memberships) bits.push(`${num(r.memberships)} collection tags`);
-    if(r.unrecognised) bits.push(`${num(r.unrecognised)} lines not permalinks`);
-    say('#rImport', `${num(r.unique ?? r.found)} distinct reels in `
+    if(r.unrecognised) bits.push(`${num(r.unrecognised)} entries missing local files`);
+    const noun = r.format === 'authorized-local-manifest' ? 'media files' : 'reels';
+    say('#rImport', `${num(r.unique ?? r.found)} distinct ${noun} in `
       + `${r.format || 'the file'}.\n` + bits.join(', ') + '.'
       + (cols ? `\nCollections: ${cols}` : ''), 'ok');
     $('#paste').value = ''; tick();

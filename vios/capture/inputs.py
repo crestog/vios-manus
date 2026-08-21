@@ -59,6 +59,55 @@ _GENERIC = re.compile(
     r"^(saved_?posts?|saved_?saved_?media|saved|bookmarks?|"
     r"your_?saved|posts?)$", re.IGNORECASE)
 
+_MANIFEST_PATH_KEYS = ("path", "local_path", "file", "media_path")
+
+
+def _manifest_entry(node) -> dict | None:
+    """Normalize one operator-authorized local-media manifest record.
+
+    The manifest intentionally accepts local paths only. A remote URL is a
+    discovery/reference field, not a download instruction; fetching it would
+    silently turn this safe source into another scraper.
+    """
+    if not isinstance(node, dict):
+        return None
+    path = next((node.get(k) for k in _MANIFEST_PATH_KEYS
+                 if isinstance(node.get(k), str) and node.get(k).strip()), "")
+    if not path or re.match(r"^[a-z][a-z0-9+.-]*://", path, re.IGNORECASE):
+        return None
+    keep = {}
+    for key in ("source_url", "url", "creator", "uploader", "title",
+                "caption", "license", "rights", "sha256", "duration",
+                "width", "height", "collection", "category"):
+        value = node.get(key)
+        if value not in (None, ""):
+            keep[key] = value
+    keep["path"] = path.strip()
+    return keep
+
+
+def parse_local_manifest(text: str) -> list[dict]:
+    """Parse a JSON array/object or newline-delimited JSON local manifest."""
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    nodes = []
+    try:
+        decoded = json.loads(raw)
+        if isinstance(decoded, dict):
+            decoded = decoded.get("items") or decoded.get("media") or [decoded]
+        nodes = decoded if isinstance(decoded, list) else []
+    except json.JSONDecodeError:
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                nodes.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return [entry for node in nodes if (entry := _manifest_entry(node))]
+
 
 def _clean_collection(name: str) -> str:
     """Normalise a collection label so the same one from two inputs agrees."""
@@ -403,6 +452,47 @@ def parse_any(path: str, data: bytes | None = None) -> dict:
     low = (path or "").lower()
     fmt = "unknown"
     items: list = []
+
+    if data is not None and (low.endswith(".jsonl") or low.endswith(".ndjson")):
+        text = data.decode("utf-8", "replace")
+        external = parse_local_manifest(text)
+        return {"items": [], "external": external,
+                "format": "authorized-local-manifest",
+                "unique": len(external), "collections": {}}
+    elif low.endswith(".jsonl") or low.endswith(".ndjson"):
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            external = parse_local_manifest(handle.read())
+        return {"items": [], "external": external,
+                "format": "authorized-local-manifest",
+                "unique": len(external), "collections": {}}
+    elif data is not None and low.endswith(".json"):
+        text = data.decode("utf-8", "replace")
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError:
+            decoded = None
+        candidates = ((decoded.get("items") or decoded.get("media") or [decoded])
+                      if isinstance(decoded, dict) else decoded)
+        if isinstance(candidates, list) and any(_manifest_entry(n)
+                                                for n in candidates):
+            external = [e for n in candidates if (e := _manifest_entry(n))]
+            return {"items": [], "external": external,
+                    "format": "authorized-local-manifest",
+                    "unique": len(external), "collections": {}}
+    elif low.endswith(".json") and data is None:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                decoded = json.load(handle)
+            candidates = ((decoded.get("items") or decoded.get("media") or [decoded])
+                          if isinstance(decoded, dict) else decoded)
+            if isinstance(candidates, list) and any(_manifest_entry(n)
+                                                    for n in candidates):
+                external = [e for n in candidates if (e := _manifest_entry(n))]
+                return {"items": [], "external": external,
+                        "format": "authorized-local-manifest",
+                        "unique": len(external), "collections": {}}
+        except (OSError, json.JSONDecodeError):
+            pass
 
     if data is not None and (low.endswith(".zip") or _looks_zip(data)):
         # An in-memory buffer satisfies zipfile's need for a seekable object

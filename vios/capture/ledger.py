@@ -37,13 +37,14 @@ several collections at once.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sqlite3
 import time
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # States a queue item can be in. Everything except `uploaded` and `unavailable`
 # is retryable; those two are terminal.
@@ -72,9 +73,10 @@ _SCHEMA = """
 PRAGMA journal_mode=WAL;
 
 CREATE TABLE IF NOT EXISTS item (
-    key           TEXT PRIMARY KEY,     -- instagram shortcode
-    url           TEXT NOT NULL,        -- canonical permalink
-    kind          TEXT,                 -- reel | p | tv
+    key           TEXT PRIMARY KEY,     -- Instagram shortcode or local digest
+    url           TEXT NOT NULL,        -- canonical permalink or file:// path
+    kind          TEXT,                 -- reel | p | tv | local-media
+    capture_meta  TEXT,                 -- authorized manifest metadata JSON
     state         TEXT NOT NULL,
     added_at      REAL NOT NULL,
     source        TEXT,                 -- which input produced this row
@@ -245,7 +247,8 @@ class Ledger:
                            ("assets_msg_id", "INTEGER"),
                            ("assets_clips", "INTEGER"),
                            ("assets_at", "REAL"),
-                           ("assets_note", "TEXT")):
+                           ("assets_note", "TEXT"),
+                           ("capture_meta", "TEXT")):
             if name not in have:
                 self.conn.execute(f"ALTER TABLE item ADD COLUMN {name} {spec}")
 
@@ -321,6 +324,100 @@ class Ledger:
                 "INSERT OR IGNORE INTO membership(key,collection) VALUES(?,?)",
                 (key, collection.strip()))
         return key
+
+    def add_external(self, path: str, metadata: dict | None = None,
+                     collection: str | None = None,
+                     source: str = "authorized-manifest",
+                     position: int | None = None) -> str | None:
+        """Queue a local, operator-authorized media file.
+
+        This is deliberately a local-file path, not a remote downloader. The
+        content owner or operator places the bytes on Kaggle (dataset, mounted
+        storage, or an explicit upload), and VIOS archives that file without
+        logging into Instagram or attempting to bypass platform controls. The
+        SHA-256 identity survives path changes and makes re-importing a manifest
+        safe across sessions.
+        """
+        path = os.path.abspath(os.path.expanduser(str(path or "").strip()))
+        if not os.path.isfile(path):
+            return None
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        key = f"local_{digest.hexdigest()[:32]}"
+        meta = dict(metadata or {})
+        meta.setdefault("path", path)
+        meta.setdefault("sha256", digest.hexdigest())
+        now = time.time()
+        row = self.conn.execute(
+            "SELECT state, capture_meta FROM item WHERE key=?", (key,)
+        ).fetchone()
+        if row is None:
+            if position is None:
+                position = self._next_position()
+            self.conn.execute(
+                "INSERT INTO item(key,url,kind,capture_meta,state,added_at,source,position) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (key, f"file://{path}", "local-media",
+                 json.dumps(meta, ensure_ascii=False, separators=(",", ":")),
+                 QUEUED, now, source, position))
+        elif not row["capture_meta"]:
+            self.conn.execute(
+                "UPDATE item SET capture_meta=?, source=? WHERE key=?",
+                (json.dumps(meta, ensure_ascii=False, separators=(",", ":")),
+                 source, key))
+        if collection:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO membership(key,collection) VALUES(?,?)",
+                (key, collection.strip()))
+        self.conn.commit()
+        return key
+
+    def add_external_many(self, items, source: str = "authorized-manifest") -> dict:
+        """Bulk queue local media manifest records with content-addressed dedupe."""
+        added = duplicate = missing = links = 0
+        pos = self._next_position()
+        for entry in items or []:
+            if not isinstance(entry, dict):
+                missing += 1
+                continue
+            path = (entry.get("path") or entry.get("local_path") or
+                    entry.get("file") or entry.get("media_path"))
+            metadata = dict(entry)
+            collection = metadata.pop("collection", None) or metadata.pop("category", None)
+            before = None
+            if path and os.path.isfile(os.path.abspath(os.path.expanduser(str(path)))):
+                before = self.conn.execute(
+                    "SELECT 1 FROM item WHERE key=?",
+                    (self._content_key(path)[0],)
+                ).fetchone()
+            key = self.add_external(path, metadata, collection, source, pos)
+            if key is None:
+                missing += 1
+            elif before:
+                duplicate += 1
+            else:
+                added += 1
+                pos += 1
+            if key and collection:
+                links += 1
+        self.log("import", f"{source}: {added} authorized local media queued, "
+                 f"{duplicate} already known, {missing} missing files")
+        return {"added": added, "duplicate": duplicate, "captured": 0,
+                "unique": added + duplicate, "memberships": links,
+                "unrecognised": missing}
+
+    @staticmethod
+    def _content_key(path: str) -> tuple[str, str]:
+        """Return the stable local-media key and full content digest."""
+        path = os.path.abspath(os.path.expanduser(str(path or "").strip()))
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        full = digest.hexdigest()
+        return "local_" + full[:32], full
 
     def add_many(self, items, source: str = "") -> dict:
         """Bulk import. `items` is an iterable of (url, collection).

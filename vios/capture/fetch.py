@@ -432,6 +432,67 @@ def build_record(url: str, key: str, work: str, info: dict,
     }
 
 
+def fetch_local(path: str, key: str, work: str, metadata: dict | None = None,
+                collections: list | None = None) -> dict:
+    """Prepare an operator-authorized local media file for Telegram upload.
+
+    This path intentionally has no HTTP client, cookie jar, proxy, or extractor.
+    The owner/operator supplies the bytes through a Kaggle dataset, mounted
+    storage, or an explicit file upload; VIOS only archives and indexes them.
+    """
+    source = os.path.abspath(os.path.expanduser(str(path or "").strip()))
+    if not os.path.isfile(source):
+        raise FetchError(f"authorized media file is missing: {source}", "unavailable")
+    os.makedirs(work, exist_ok=True)
+    ext = os.path.splitext(source)[1].lower() or ".mp4"
+    if ext not in VIDEO_EXT + IMAGE_EXT:
+        raise FetchError(f"unsupported authorized media type: {ext}", "unavailable")
+    dest = os.path.join(work, f"{key}{ext}")
+    try:
+        shutil.copy2(source, dest)
+    except OSError as exc:
+        raise FetchError(f"cannot stage authorized media: {exc}", "transient")
+
+    meta = dict(metadata or {})
+    reference = str(meta.get("source_url") or meta.get("url")
+                    or f"authorized://{key}")
+    public_meta = dict(meta)
+    public_meta.pop("path", None)
+    public_meta.pop("local_path", None)
+    public_meta.pop("file", None)
+    public_meta.pop("media_path", None)
+    info = {
+        "id": key,
+        "title": str(meta.get("title") or os.path.basename(source))[:500],
+        "description": str(meta.get("caption") or "")[:4000],
+        "uploader": meta.get("creator") or meta.get("uploader") or "",
+        "timestamp": meta.get("taken_at"),
+        "duration": meta.get("duration"),
+        "width": meta.get("width"),
+        "height": meta.get("height"),
+    }
+    record = build_record(reference, key, work, info, collections or [],
+                          "authorized local media; no remote fetch", "authorized-local")
+    digest = _sha256(dest)
+    record["source"] = {"kind": "authorized-local",
+                         "filename": os.path.basename(source),
+                         "reference": reference,
+                         "license": meta.get("license") or meta.get("rights") or "",
+                         "manifest": public_meta}
+    record["media"] = {"filename": os.path.basename(dest),
+                       "bytes": os.path.getsize(dest), "sha256": digest,
+                       "kind": "video" if ext in VIDEO_EXT else "photo",
+                       "images": []}
+    record_path = os.path.join(work, f"{key}.vios.json")
+    with open(record_path, "w", encoding="utf-8") as handle:
+        json.dump(record, handle, ensure_ascii=False, separators=(",", ":"))
+    return {"video": dest if ext in VIDEO_EXT else None,
+            "images": [dest] if ext in IMAGE_EXT else [],
+            "record": record, "record_path": record_path, "info": info,
+            "bytes": os.path.getsize(dest), "sha256": digest,
+            "tool": "authorized-local", "log": "local media staged"}
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # The one call the engine makes
 # ═══════════════════════════════════════════════════════════════════════

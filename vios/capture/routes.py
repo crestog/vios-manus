@@ -167,6 +167,7 @@ async def config(
     api_hash: str = Form(""),
     cookies_text: str = Form(""),
     target_seconds: str = Form(""),
+    local_target_seconds: str = Form(""),
     quiet_hours: str = Form(""),
     breaks: str = Form(""),
     skip_collections: str = Form(""),
@@ -194,6 +195,7 @@ async def config(
             api_hash=api_hash.strip(),
             cookies_text=cookies_text,
             target=_int(target_seconds) or None,
+            local_target=_int(local_target_seconds) or None,
             quiet_hours=_bool(quiet_hours),
             breaks=_bool(breaks),
             skip_collections=([c.strip() for c in skip_collections.split(",")
